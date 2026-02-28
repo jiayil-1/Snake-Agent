@@ -1,0 +1,7 @@
+__pycache__/
+.conda_env/
+.venv_snake/
+.vscode
+logs/
+*.slurm
+*.pt
