@@ -26,11 +26,11 @@ BLUE2 = (0, 100, 255)
 BLACK = (0,0,0)
 
 BLOCK_SIZE = 20
-SPEED = 1000000
+SPEED = 120
 
 STEP_PENALTY = -0.01
-PROGRESS_REWARD = 0.1
-PROGRESS_PENALTY = -0.1
+PROGRESS_REWARD = 0
+PROGRESS_PENALTY = 0
 FOOD_REWARD = 10
 COLLISION_PENALTY = -10
 TIMEOUT_PENALTY = -5
@@ -95,7 +95,7 @@ class SnakeGameAI:
         
         # 3. check if game over
         game_over = False
-        if self.frame_iteration > 50*len(self.snake):
+        if self.frame_iteration > 100*len(self.snake):
             game_over = True
             self.end_reason = 'timeout'
             reward += TIMEOUT_PENALTY
