@@ -1,0 +1,121 @@
+"""Load and validate data-only model presets before training creates files."""
+
+import argparse
+from copy import deepcopy
+import json
+import math
+from pathlib import Path
+import re
+
+from model import ARCHITECTURES, ARCHITECTURE_DEFAULTS
+
+
+REPO_ROOT = Path(__file__).resolve().parent
+DEFAULT_TRAINING = {
+    'max_memory': 100_000,
+    'replay_batch_size': 64,
+    'replay_warmup': 1000,
+    'train_every': 4,
+    'lr': 0.001,
+    'gamma': 0.99,
+    'epsilon_start': 1.0,
+    'epsilon_min': 0.001,
+    'epsilon_decay': 0.997,
+    'max_grad_norm': 5.0,
+    'lr_step_size': 500,
+    'lr_decay': 0.95,
+    'min_lr': 0.00001,
+}
+
+
+def validate_name(name):
+    if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*', name):
+        raise ValueError('Names must start with a letter or digit and contain only letters, digits, _ or -')
+    return name
+
+
+def positive_int(value):
+    try:
+        parsed = int(value)
+    except ValueError as err:
+        raise argparse.ArgumentTypeError('must be a positive integer') from err
+    if parsed < 1:
+        raise argparse.ArgumentTypeError('must be a positive integer')
+    return parsed
+
+
+def _object(value, label, allowed):
+    if not isinstance(value, dict):
+        raise ValueError(f'{label} must be a JSON object')
+    unknown = value.keys() - allowed
+    if unknown:
+        raise ValueError(f'Unknown {label} settings: {", ".join(sorted(unknown))}')
+
+
+def resolve_preset(preset):
+    """Return a new, complete configuration; never mutate the supplied preset."""
+    _object(preset, 'preset', {'architecture', 'architecture_options', 'training'})
+    architecture = preset.get('architecture')
+    if not isinstance(architecture, str) or architecture not in ARCHITECTURES:
+        raise ValueError(f'Unknown architecture {architecture!r}; choose from {", ".join(ARCHITECTURES)}')
+
+    defaults = ARCHITECTURE_DEFAULTS[architecture]
+    options = preset.get('architecture_options', {})
+    _object(options, 'architecture_options', defaults.keys())
+    options = deepcopy(defaults) | deepcopy(options)
+    if 'hidden_sizes' in options:
+        sizes = options['hidden_sizes']
+        if not isinstance(sizes, list) or not sizes or any(type(n) is not int or n < 1 for n in sizes):
+            raise ValueError('hidden_sizes must be a nonempty array of positive integers')
+
+    training = preset.get('training', {})
+    _object(training, 'training', DEFAULT_TRAINING.keys())
+    training = DEFAULT_TRAINING | training
+    for name, value in training.items():
+        if name == 'min_lr' and value is None:
+            continue
+        if type(DEFAULT_TRAINING[name]) is int:
+            if type(value) is not int or value < 1:
+                raise ValueError(f'{name} must be a positive integer')
+        elif type(value) not in (int, float) or not math.isfinite(value):
+            raise ValueError(f'{name} must be a finite number')
+        elif name in ('gamma', 'epsilon_start', 'epsilon_min'):
+            if not 0 <= value <= 1:
+                raise ValueError(f'{name} must be between 0 and 1')
+        elif name in ('epsilon_decay', 'lr_decay'):
+            if not 0 < value <= 1:
+                raise ValueError(f'{name} must be greater than 0 and at most 1')
+        elif value <= 0:
+            raise ValueError(f'{name} must be positive')
+
+    if training['epsilon_min'] > training['epsilon_start']:
+        raise ValueError('epsilon_min cannot exceed epsilon_start')
+    if training['max_memory'] < max(training['replay_batch_size'], training['replay_warmup']):
+        raise ValueError('max_memory must accommodate replay_batch_size and replay_warmup')
+    if training['min_lr'] is not None and training['min_lr'] > training['lr']:
+        raise ValueError('min_lr cannot exceed lr')
+    return {'architecture': architecture, 'architecture_options': options, 'training': training}
+
+
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f'Duplicate JSON key: {key}')
+        result[key] = value
+    return result
+
+
+def load_presets(path=REPO_ROOT / 'models.json'):
+    with Path(path).open() as config_file:
+        presets = json.load(config_file, object_pairs_hook=_unique_object)
+    if not isinstance(presets, dict) or not presets:
+        raise ValueError('models.json must contain an object with at least one named preset')
+    resolved = {}
+    for name, preset in presets.items():
+        validate_name(name)
+        try:
+            resolved[name] = resolve_preset(preset)
+        except ValueError as err:
+            raise ValueError(f'Preset {name!r}: {err}') from err
+    return resolved

@@ -20,7 +20,74 @@ python -m pip uninstall pygame
 python -m pip install -r requirements.txt
 ```
 
-## Train the agent
+## Train named models
+
+Use `train.py` for independent models defined in the repository's `models.json`:
+
+```bash
+python train.py --list
+python train.py --model residual_cnn --games 1000
+python train.py --model mlp --games 1000
+python train.py --model residual_cnn --run cnn-experiment --games 1000
+```
+
+The included `residual_cnn` preset uses the existing residual CNN. The `mlp` preset flattens the same board input, combines it with metadata, and uses two 128-unit hidden layers. Both use the same DQN trainer and three actions.
+
+`--games` counts completed games in this invocation; omit it to train until stopped. Add `--render` to display the game, `--device cpu` to force CPU, or `--device cuda` / `--device mps` to select an available accelerator. The default device is `auto`: CUDA, then MPS, then CPU. `--reset-epsilon` resets exploration to the preset's `epsilon_start` while preserving learned weights and completed-game counters.
+
+Each run writes to `runs/<run-name>/` relative to the repository, even when the command is launched from another directory. The run name defaults to the preset name. Choose another `--run` name to start a separate model with that preset. Use distinct run names when training multiple processes.
+
+| Run file | Purpose |
+| --- | --- |
+| `latest.pth` | Weights, optimizer, scheduler, counters, exploration state, records, and configuration for resuming. Saved after every completed episode and on graceful termination. |
+| `best.pth` | Checkpoint from the completed episode with the highest cumulative reward. |
+| `training_scores.csv` | This run's cumulative game numbers, scores, and ending reasons. |
+| `config.json` | Fully resolved configuration, including defaults, used by this run. |
+
+Repeat the same command to resume automatically from `latest.pth`. `Ctrl+C` or a termination signal saves latest progress, including updates made during an unfinished episode, without logging that episode as completed. Resume starts a new episode with an empty replay buffer. Abrupt termination can only recover the last saved checkpoint. Generated run folders are ignored by Git.
+
+### Configure another model
+
+Add another top-level entry to `models.json`. For example, add this preset alongside the existing entries:
+
+```json
+"mlp-small": {
+  "architecture": "mlp",
+  "architecture_options": {"hidden_sizes": [64, 64]},
+  "training": {
+    "lr": 0.0005,
+    "replay_batch_size": 32,
+    "epsilon_decay": 0.995
+  }
+}
+```
+
+Then run `python train.py --model mlp-small --games 1000`. JSON must use double quotes and cannot contain comments or trailing commas. Names may contain letters, digits, underscores, and hyphens, starting with a letter or digit. Unknown settings, duplicate keys, unsupported architectures, and invalid numeric values are rejected before outputs are created.
+
+The `residual_cnn` entry shows all supported training settings and their current defaults. Missing training settings use those defaults; `training: {}` selects them all. `architecture_options` defaults to `{}` for the CNN and `{"hidden_sizes": [128, 128]}` for the MLP. Hidden sizes must be a nonempty array of positive integers. Replay capacity must accommodate both batch size and warmup. Exploration values and gamma must be in `[0, 1]`, decay factors in `(0, 1]`, and `epsilon_min` cannot exceed `epsilon_start`. Other settings must be positive; `min_lr` may also be `null` to disable the learning-rate floor and cannot exceed the initial learning rate.
+
+An existing run's resolved configuration must match the selected preset and its checkpoint. If you edit a preset's settings, select a new `--run` name. To keep both experiments easy to select, create a new preset name instead. A new run starts with fresh weights.
+
+To add a different network architecture, implement a `torch.nn.Module` in `model.py` with constructor arguments `board_height`, `board_width`, `metadata_size`, and `output_size`, plus any architecture options. Its `forward(state)` receives `board_state` with shape `(batch, 3, height, width)` and `metadata` with shape `(batch, 12)`, and returns `(batch, 3)` Q-values. Support unbatched state inputs as the existing networks do. Register the class in `ARCHITECTURES`, add its JSON option defaults to `ARCHITECTURE_DEFAULTS`, and validate any new option types/ranges in `configuration.resolve_preset`. JSON selects registered Python classes; it never executes code.
+
+### Import the existing model
+
+```bash
+python train.py --model residual_cnn --run legacy --import-legacy
+python train.py --model residual_cnn --run legacy --games 1000
+```
+
+Import validates `model/model.pth`, copies it into both checkpoint slots, copies `training_scores.csv` if present, and records the resolved configuration. It exits without training and rejects an occupied destination. The original checkpoint and history remain untouched. For checkpoints saved before configurations were recorded, select the preset matching the architecture and original training settings. If the old CSV extends beyond its best-reward checkpoint, learned state resumes from that checkpoint while CSV numbering continues from the final logged game.
+
+Plot a named run with the existing plotter:
+
+```bash
+python plot_training_scores.py --csv runs/mlp/training_scores.csv --out runs/mlp/training_scores_plot.png
+```
+
+## Legacy training
+
+The original entrypoint remains available with its existing paths and best-reward-only save policy:
 
 ```bash
 python agent.py
@@ -60,9 +127,12 @@ python plot_training_scores.py --csv training_scores.csv --out training_scores_p
 
 | File | Purpose |
 | --- | --- |
-| `agent.py` | Training entry point, agent state/action logic, replay memory, and checkpoint saving/loading. |
+| `train.py` | Shared command-line entrypoint for named model training and legacy import. |
+| `models.json` | Editable named architecture and training presets. |
+| `configuration.py` | Preset defaults, JSON loading, and validation. |
+| `agent.py` | Shared training loop, agent state/action logic, replay memory, checkpoints, and legacy entrypoint. |
 | `game.py` | Snake game environment used during training. |
-| `model.py` | DQN network and trainer. |
+| `model.py` | Registered CNN and MLP networks, device selection, and DQN trainer. |
 | `helper.py` | Training score plotting and CSV logging. |
 | `plot_training_scores.py` | Command-line tool that plots scores from the CSV file. |
 | `requirements.txt` | Python packages needed to train and plot. |
@@ -70,3 +140,13 @@ python plot_training_scores.py --csv training_scores.csv --out training_scores_p
 | `training_scores.csv` | Per-game number, score, and ending reason data. |
 | `training_scores_plot.png` | Generated chart of the training scores. |
 | `arial.ttf` | Font used by the game's display when rendering is enabled. |
+
+## Tests
+
+Run unit tests and headless CLI integration tests:
+
+```bash
+SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy MPLBACKEND=Agg python -m unittest -v
+```
+
+The tests use temporary run directories and do not train or import into your repository's saved model or score history.

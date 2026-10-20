@@ -104,6 +104,47 @@ class Linear_QNet(nn.Module):
         torch.save({'model_state_dict': self.state_dict(), 'metadata': default_metadata}, file_name)
 
 
+class MLP_QNet(nn.Module):
+    """Flatten the board and combine it with metadata before an MLP."""
+
+    def __init__(self, board_height, board_width, metadata_size, output_size,
+                 hidden_sizes=(128, 128)):
+        super().__init__()
+        sizes = [3 * board_height * board_width + metadata_size, *hidden_sizes]
+        layers = []
+        for input_size, hidden_size in zip(sizes, sizes[1:]):
+            layers.extend([nn.Linear(input_size, hidden_size), nn.ReLU()])
+        layers.append(nn.Linear(sizes[-1], output_size))
+        self.layers = nn.Sequential(*layers)
+
+    def forward(self, state):
+        board = state['board_state']
+        metadata = state['metadata']
+        if board.dim() == 3:
+            board = board.unsqueeze(0)
+        if metadata.dim() == 1:
+            metadata = metadata.unsqueeze(0)
+        return self.layers(torch.cat((board.flatten(1), metadata), dim=1))
+
+
+# Explicit registry: configuration never imports or evaluates arbitrary code.
+ARCHITECTURES = {'residual_cnn': Linear_QNet, 'mlp': MLP_QNet}
+ARCHITECTURE_DEFAULTS = {'residual_cnn': {}, 'mlp': {'hidden_sizes': [128, 128]}}
+
+
+def resolve_device(device='auto'):
+    if device == 'auto':
+        device = ('cuda' if torch.cuda.is_available()
+                  else 'mps' if torch.backends.mps.is_available() else 'cpu')
+    if device not in ('cpu', 'cuda', 'mps'):
+        raise ValueError('device must be auto, cpu, cuda, or mps')
+    if device == 'cuda' and not torch.cuda.is_available():
+        raise ValueError('CUDA is unavailable; use --device cpu or auto')
+    if device == 'mps' and not torch.backends.mps.is_available():
+        raise ValueError('MPS is unavailable; use --device cpu or auto')
+    return torch.device(device)
+
+
 class QTrainer:
     """Standard DQN trainer with TD learning."""
 
@@ -116,15 +157,12 @@ class QTrainer:
         lr_step_size=500,
         lr_decay=0.95,
         min_lr=1e-5,
+        device='auto',
     ):
         self.lr = lr
         self.gamma = gamma
         self.min_lr = min_lr
-        self.device = torch.device(
-            "cuda" if torch.cuda.is_available()
-            else "mps" if torch.backends.mps.is_available()
-            else "cpu"
-        )
+        self.device = resolve_device(device)
         print(f'Using {self.device} to train')
         self.model = model.to(self.device)
         self.max_grad_norm = max_grad_norm

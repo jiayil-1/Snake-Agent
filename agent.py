@@ -9,19 +9,20 @@ from copy import deepcopy
 from datetime import datetime
 from collections import deque
 from game import SnakeGameAI, Direction, Point, BLOCK_SIZE
-from model import Linear_QNet, QTrainer
+from model import ARCHITECTURES, QTrainer, resolve_device
+from configuration import DEFAULT_TRAINING, positive_int, resolve_preset
 from helper import plot
 
 # ── Hyperparameters ──────────────────────────────────────────────────────
-MAX_MEMORY = 100_000
-BATCH_SIZE = 64
-REPLAY_WARMUP = 1000
-TRAIN_EVERY = 4
-LR = 1e-3
-GAMMA = 0.99
-EPSILON_START = 1.0
-EPSILON_MIN = 0.001
-EPSILON_DECAY = 0.997
+MAX_MEMORY = DEFAULT_TRAINING['max_memory']
+BATCH_SIZE = DEFAULT_TRAINING['replay_batch_size']
+REPLAY_WARMUP = DEFAULT_TRAINING['replay_warmup']
+TRAIN_EVERY = DEFAULT_TRAINING['train_every']
+LR = DEFAULT_TRAINING['lr']
+GAMMA = DEFAULT_TRAINING['gamma']
+EPSILON_START = DEFAULT_TRAINING['epsilon_start']
+EPSILON_MIN = DEFAULT_TRAINING['epsilon_min']
+EPSILON_DECAY = DEFAULT_TRAINING['epsilon_decay']
 HIDE_PLOT = True
 TRAINING_SCORES_CSV = 'training_scores.csv'
 DEFAULT_CHECKPOINT_PATH = 'model/model.pth'
@@ -30,20 +31,27 @@ class Agent:
 
     def __init__(self, board_width=640, board_height=480,
                  checkpoint_path=DEFAULT_CHECKPOINT_PATH,
-                 replay_batch_size=BATCH_SIZE,
-                 replay_warmup=REPLAY_WARMUP,
-                 train_every=TRAIN_EVERY):
-        if replay_batch_size < 1 or replay_warmup < 1 or train_every < 1:
-            raise ValueError('Replay batch size, warmup, and train interval must be positive')
+                 replay_batch_size=None,
+                 replay_warmup=None,
+                 train_every=None, config=None, device='auto',
+                 strict_checkpoint=False):
+        self.config = resolve_preset(config if config is not None else {'architecture': 'residual_cnn'})
+        overrides = {'replay_batch_size': replay_batch_size,
+                     'replay_warmup': replay_warmup, 'train_every': train_every}
+        self.config['training'].update({key: value for key, value in overrides.items()
+                                        if value is not None})
+        self.config = resolve_preset(self.config)
+        settings = self.config['training']
+        self.strict_checkpoint = strict_checkpoint
         self.n_games = 0
         self.epsilon_start_game = 0
         self.record = 0
         self.best_reward = float('-inf')
-        self.epsilon = EPSILON_START
-        self.gamma = GAMMA
-        self.replay_batch_size = replay_batch_size
-        self.replay_warmup = replay_warmup
-        self.train_every = train_every
+        self.epsilon = settings['epsilon_start']
+        self.gamma = settings['gamma']
+        self.replay_batch_size = settings['replay_batch_size']
+        self.replay_warmup = settings['replay_warmup']
+        self.train_every = settings['train_every']
         self.environment_steps = 0
         self.board_width = board_width
         self.board_height = board_height
@@ -55,33 +63,36 @@ class Agent:
         # Metadata: 4 dir + 3 danger + 4 food_dir + 1 food_dist = 12
         self.metadata_size = 12
 
-        self.device = torch.device(
-            "cuda" if torch.cuda.is_available()
-            else "mps" if torch.backends.mps.is_available()
-            else "cpu"
-        )
+        self.device = resolve_device(device)
 
-        self.model = Linear_QNet(
+        self.model = ARCHITECTURES[self.config['architecture']](
             board_height=self.grid_height,
             board_width=self.grid_width,
             metadata_size=self.metadata_size,
             output_size=3,
+            **self.config['architecture_options'],
         ).to(self.device)
-        self.trainer = QTrainer(self.model, lr=LR, gamma=self.gamma)
+        self.trainer = QTrainer(
+            self.model, gamma=self.gamma, device=self.device.type,
+            **{key: settings[key] for key in
+               ('lr', 'max_grad_norm', 'lr_step_size', 'lr_decay', 'min_lr')},
+        )
         self._load_checkpoint(checkpoint_path)
 
-        # Simple replay buffer (deque) — ~4.6 KB per transition at uint8
-        # 100K transitions ≈ 460 MB, well under 16 GB
-        self.memory = deque(maxlen=MAX_MEMORY)
+        # Replay is repopulated in memory after checkpoint resume.
+        self.memory = deque(maxlen=settings['max_memory'])
 
     def _load_checkpoint(self, checkpoint_path):
         try:
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
         except FileNotFoundError:
             print(f'No checkpoint found at {checkpoint_path}. Starting with a fresh model.')
             return
 
         wrapped = isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint
+        if (self.strict_checkpoint and wrapped and 'config' in checkpoint
+                and checkpoint['config'] != self.config):
+            raise ValueError('Checkpoint configuration differs from this preset; use a new --run name')
         model_state = checkpoint['model_state_dict'] if wrapped else checkpoint
         # Strict loading can copy matching tensors before reporting a mismatch.
         # Validate on a copy so rejected checkpoints never alter the live model.
@@ -89,6 +100,8 @@ class Agent:
         try:
             candidate.load_state_dict(model_state)
         except RuntimeError as err:
+            if self.strict_checkpoint:
+                raise ValueError(f'Checkpoint architecture mismatch: {err}') from err
             print(f'Checkpoint architecture mismatch ({err}). Starting with a fresh model.')
             return
         self.model.load_state_dict(candidate.state_dict())
@@ -99,6 +112,8 @@ class Agent:
                 try:
                     self.trainer.optimizer.load_state_dict(optimizer_state)
                 except ValueError as err:
+                    if self.strict_checkpoint:
+                        raise ValueError(f'Optimizer state mismatch: {err}') from err
                     print(f'Optimizer state mismatch ({err}). Continuing with fresh optimizer state.')
 
             scheduler_state = checkpoint.get('scheduler_state_dict')
@@ -118,6 +133,8 @@ class Agent:
                         scheduler_state['step_size'] = new_step_size
                     self.trainer.scheduler.load_state_dict(scheduler_state)
                 except ValueError as err:
+                    if self.strict_checkpoint:
+                        raise ValueError(f'Scheduler state mismatch: {err}') from err
                     print(f'Scheduler state mismatch ({err}). Continuing with fresh scheduler state.')
 
             training_state = checkpoint.get('training_state', {})
@@ -260,9 +277,10 @@ class Agent:
 
     def _update_epsilon(self):
         games_since_reset = max(0, self.n_games - self.epsilon_start_game)
+        settings = self.config['training']
         self.epsilon = max(
-            EPSILON_MIN,
-            EPSILON_START * (EPSILON_DECAY ** games_since_reset),
+            settings['epsilon_min'],
+            settings['epsilon_start'] * (settings['epsilon_decay'] ** games_since_reset),
         )
 
 
@@ -274,6 +292,10 @@ def save_checkpoint_atomic(agent, metadata=None,
 
     checkpoint_metadata = {
         'saved_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'record': agent.record,
+        'best_reward': agent.best_reward,
+        'n_games': agent.n_games,
+        'epsilon_start_game': agent.epsilon_start_game,
     }
     if metadata:
         checkpoint_metadata.update(metadata)
@@ -287,6 +309,7 @@ def save_checkpoint_atomic(agent, metadata=None,
             'optimizer_steps': agent.trainer.optimizer_steps,
         },
         'metadata': checkpoint_metadata,
+        'config': agent.config,
     }
 
     try:
@@ -312,26 +335,33 @@ def read_last_game_number(csv_path=TRAINING_SCORES_CSV):
 
 
 def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
-          csv_path=TRAINING_SCORES_CSV, render=False, reset_epsilon=False):
+          csv_path=TRAINING_SCORES_CSV, render=False, reset_epsilon=False,
+          config=None, device='auto', agent=None, best_checkpoint_path=None):
+    """Train one agent. A separate best path enables latest-plus-best saving."""
     plot_scores = []
     plot_mean_scores = []
     recent_scores = deque(maxlen=100)
     game_number_offset = read_last_game_number(csv_path)
     os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
     game = SnakeGameAI(render=render)
-    agent = Agent(
-        board_width=game.w,
-        board_height=game.h,
-        checkpoint_path=checkpoint_path,
-    )
+    if agent is None:
+        agent = Agent(
+            board_width=game.w,
+            board_height=game.h,
+            checkpoint_path=checkpoint_path,
+            config=config,
+            device=device,
+            strict_checkpoint=best_checkpoint_path is not None,
+        )
     if reset_epsilon:
         agent.epsilon_start_game = agent.n_games
-        agent.epsilon = EPSILON_START
-        print('Epsilon reset to 1.0000 for this run.')
+        agent._update_epsilon()
+        print(f'Epsilon reset to {agent.epsilon:.4f} for this run.')
     record = agent.record
     games_this_run = 0
     total_reward = 0
     termination_requested = False
+    graceful_exit = False
 
     def request_termination(signum, _frame):
         nonlocal termination_requested
@@ -340,12 +370,13 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
             print(f'Received signal {signum}. Will stop after the current game step.',
                   flush=True)
 
-    signal.signal(signal.SIGTERM, request_termination)
-    signal.signal(signal.SIGINT, request_termination)
+    signals = [signal.SIGTERM, signal.SIGINT]
     if hasattr(signal, 'SIGUSR1'):
-        signal.signal(signal.SIGUSR1, request_termination)
+        signals.append(signal.SIGUSR1)
+    previous_handlers = {sig: signal.signal(sig, request_termination) for sig in signals}
 
     try:
+        print('Training started.', flush=True)
         while True:
             # 1. Get old state
             state_old = agent.get_state(game)
@@ -364,8 +395,10 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
 
             # ── Mid-episode termination ──────────────────────────────────
             if termination_requested and not done:
-                print('Termination requested mid-episode. Exiting without a checkpoint.',
-                      flush=True)
+                graceful_exit = True
+                message = ('Latest progress will be saved.' if best_checkpoint_path is not None
+                           else 'Exiting without a checkpoint.')
+                print(f'Termination requested mid-episode. {message}', flush=True)
                 break
 
             # ── Episode finished ─────────────────────────────────────────
@@ -380,6 +413,7 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
 
                 if score > record:
                     record = score
+                agent.record = record
 
                 new_highest_reward = episode_reward > agent.best_reward
                 if new_highest_reward:
@@ -392,7 +426,8 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
                             'n_games': agent.n_games,
                             'epsilon_start_game': agent.epsilon_start_game,
                         },
-                        checkpoint_path=checkpoint_path,
+                        checkpoint_path=(best_checkpoint_path if best_checkpoint_path is not None
+                                         else checkpoint_path),
                     )
                     print(f'New highest reward {episode_reward:.1f}. Saved checkpoint.')
 
@@ -417,33 +452,36 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
                     game_number_offset=game_number_offset,
                     end_reason=end_reason,
                 )
+                if best_checkpoint_path is not None:
+                    save_checkpoint_atomic(agent, checkpoint_path=checkpoint_path)
 
                 if termination_requested:
+                    graceful_exit = True
                     print('Termination requested. Episode completed. Exiting.',
                           flush=True)
                     break
                 if run_limit_reached:
+                    graceful_exit = True
                     print(f'Completed {games_this_run} game(s). Exiting.')
                     break
 
     except (KeyboardInterrupt, SystemExit):
-        print('\nTermination requested. Exiting without a checkpoint.')
+        graceful_exit = True
+        message = ('Latest progress will be saved.' if best_checkpoint_path is not None
+                   else 'Exiting without a checkpoint.')
+        print(f'\nTermination requested. {message}')
     finally:
         try:
-            import pygame
-            pygame.quit()
-        except Exception:
-            pass
-
-
-def positive_int(value):
-    try:
-        parsed = int(value)
-    except ValueError as err:
-        raise argparse.ArgumentTypeError('must be a positive integer') from err
-    if parsed < 1:
-        raise argparse.ArgumentTypeError('must be a positive integer')
-    return parsed
+            if graceful_exit and best_checkpoint_path is not None:
+                save_checkpoint_atomic(agent, checkpoint_path=checkpoint_path)
+        finally:
+            for sig, handler in previous_handlers.items():
+                signal.signal(sig, handler)
+            try:
+                import pygame
+                pygame.quit()
+            except Exception:
+                pass
 
 
 if __name__ == '__main__':

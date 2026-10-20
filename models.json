@@ -1,0 +1,28 @@
+{
+  "residual_cnn": {
+    "architecture": "residual_cnn",
+    "architecture_options": {},
+    "training": {
+      "max_memory": 100000,
+      "replay_batch_size": 64,
+      "replay_warmup": 1000,
+      "train_every": 4,
+      "lr": 0.001,
+      "gamma": 0.99,
+      "epsilon_start": 1.0,
+      "epsilon_min": 0.001,
+      "epsilon_decay": 0.997,
+      "max_grad_norm": 5.0,
+      "lr_step_size": 500,
+      "lr_decay": 0.95,
+      "min_lr": 0.00001
+    }
+  },
+  "mlp": {
+    "architecture": "mlp",
+    "architecture_options": {
+      "hidden_sizes": [128, 128]
+    },
+    "training": {}
+  }
+}
