@@ -1,5 +1,6 @@
 import argparse
 import csv
+from collections import deque
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -8,19 +9,27 @@ import matplotlib.pyplot as plt
 def load_training_data(csv_path: Path):
     games = []
     scores = []
-    mean_scores = []
 
     with csv_path.open(newline="") as csv_file:
         reader = csv.DictReader(csv_file)
         for row in reader:
             games.append(int(row['game']))
             scores.append(float(row['score']))
-            mean_scores.append(float(row['mean_score']))
 
-    return games, scores, mean_scores
+    return games, scores
 
 
-def plot_training_data(games, scores, mean_scores, output_path: Path):
+def calculate_rolling_mean(scores, window_size=100):
+    recent_scores = deque(maxlen=window_size)
+    mean_scores = []
+    for score in scores:
+        recent_scores.append(score)
+        mean_scores.append(sum(recent_scores) / len(recent_scores))
+    return mean_scores
+
+
+def plot_training_data(games, scores, output_path: Path):
+    mean_scores = calculate_rolling_mean(scores)
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.plot(games, scores, label="Score")
     ax.plot(games, mean_scores, label="Mean Score")
@@ -56,11 +65,11 @@ def main():
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV file not found: {csv_path}")
 
-    games, scores, mean_scores = load_training_data(csv_path)
+    games, scores = load_training_data(csv_path)
     if not games:
         raise ValueError(f"CSV has no rows: {csv_path}")
 
-    plot_training_data(games, scores, mean_scores, Path(args.out))
+    plot_training_data(games, scores, Path(args.out))
     print(f"Saved plot to {args.out}")
 
 

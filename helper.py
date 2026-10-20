@@ -2,7 +2,8 @@ import matplotlib.pyplot as plt
 import csv
 import os
 
-def plot(scores, mean_scores, csv_path=None, png_path=None, hidden=True):
+def plot(scores, mean_scores, csv_path=None, png_path=None, hidden=True,
+         game_number_offset=0):
     if hidden:
         plt.ioff()
         fig, ax = plt.subplots()
@@ -28,17 +29,17 @@ def plot(scores, mean_scores, csv_path=None, png_path=None, hidden=True):
         plt.show(block=False)
         plt.pause(.1)
 
-    if csv_path and scores and mean_scores:
+    if csv_path and scores:
         file_exists = os.path.exists(csv_path)
         file_is_empty = (not file_exists) or os.path.getsize(csv_path) == 0
 
         with open(csv_path, 'a', newline='') as csv_file:
             writer = csv.writer(csv_file)
             if file_is_empty:
-                writer.writerow(['game', 'score', 'mean_score'])
+                writer.writerow(['game', 'score'])
 
-            game_index = min(len(scores), len(mean_scores))
-            writer.writerow([game_index, scores[-1], mean_scores[-1]])
+            game_index = game_number_offset + len(scores)
+            writer.writerow([game_index, scores[-1]])
 
     if png_path:
         if hidden:

@@ -1,8 +1,10 @@
+import argparse
 import torch
 import random
 import numpy as np
 import os
 import signal
+import csv
 from copy import deepcopy
 from datetime import datetime
 from collections import deque
@@ -19,13 +21,16 @@ EPSILON_START = 1.0
 EPSILON_MIN = 0.01
 EPSILON_DECAY = 0.998
 HIDE_PLOT = True
-SAVE_EVERY = 100
+TRAINING_SCORES_CSV = 'training_scores.csv'
+DEFAULT_CHECKPOINT_PATH = 'model/model.pth'
 
 class Agent:
 
-    def __init__(self, board_width=640, board_height=480):
+    def __init__(self, board_width=640, board_height=480,
+                 checkpoint_path=DEFAULT_CHECKPOINT_PATH):
         self.n_games = 0
         self.record = 0
+        self.best_reward = float('-inf')
         self.epsilon = EPSILON_START
         self.gamma = GAMMA
         self.board_width = board_width
@@ -51,7 +56,7 @@ class Agent:
             output_size=3,
         ).to(self.device)
         self.trainer = QTrainer(self.model, lr=LR, gamma=self.gamma)
-        self._load_checkpoint('model/model.pth')
+        self._load_checkpoint(checkpoint_path)
 
         # Simple replay buffer (deque) — ~4.6 KB per transition at uint8
         # 100K transitions ≈ 460 MB, well under 16 GB
@@ -94,6 +99,7 @@ class Agent:
             metadata = checkpoint.get('metadata', {})
             print('Loaded checkpoint metadata:', metadata)
             self.record = metadata.get('record', 0)
+            self.best_reward = metadata.get('best_reward', float('-inf'))
             self.n_games = metadata.get('n_games', 0)
             self.epsilon = max(
                 EPSILON_MIN,
@@ -220,12 +226,11 @@ class Agent:
         return final_move
 
 
-def save_checkpoint_atomic(agent, metadata=None, file_name='model.pth'):
-    model_folder_path = './model'
-    os.makedirs(model_folder_path, exist_ok=True)
-
-    final_path = os.path.join(model_folder_path, file_name)
-    temp_path = f"{final_path}.tmp.{os.getpid()}"
+def save_checkpoint_atomic(agent, metadata=None,
+                           checkpoint_path=DEFAULT_CHECKPOINT_PATH):
+    checkpoint_path = os.fspath(checkpoint_path)
+    os.makedirs(os.path.dirname(os.path.abspath(checkpoint_path)), exist_ok=True)
+    temp_path = f"{checkpoint_path}.tmp.{os.getpid()}"
 
     checkpoint_metadata = {
         'saved_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -242,29 +247,49 @@ def save_checkpoint_atomic(agent, metadata=None, file_name='model.pth'):
 
     try:
         torch.save(checkpoint, temp_path)
-        os.replace(temp_path, final_path)
+        os.replace(temp_path, checkpoint_path)
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
 
-def train():
+def read_last_game_number(csv_path=TRAINING_SCORES_CSV):
+    try:
+        with open(csv_path, newline='') as csv_file:
+            reader = csv.DictReader(csv_file)
+            last_game_number = 0
+            for row in reader:
+                game_number = row.get('game')
+                if game_number:
+                    last_game_number = int(game_number)
+            return last_game_number
+    except FileNotFoundError:
+        return 0
+
+
+def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
+          csv_path=TRAINING_SCORES_CSV, render=False):
     plot_scores = []
     plot_mean_scores = []
     recent_scores = deque(maxlen=100)
-    game = SnakeGameAI(render=False)
-    agent = Agent(board_width=game.w, board_height=game.h)
+    game_number_offset = read_last_game_number(csv_path)
+    os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
+    game = SnakeGameAI(render=render)
+    agent = Agent(
+        board_width=game.w,
+        board_height=game.h,
+        checkpoint_path=checkpoint_path,
+    )
     record = agent.record
+    games_this_run = 0
     total_reward = 0
     termination_requested = False
-    termination_signal = None
 
     def request_termination(signum, _frame):
-        nonlocal termination_requested, termination_signal
+        nonlocal termination_requested
         if not termination_requested:
             termination_requested = True
-            termination_signal = signum
-            print(f'Received signal {signum}. Will terminate after a safe checkpoint.',
+            print(f'Received signal {signum}. Will stop after the current game step.',
                   flush=True)
 
     signal.signal(signal.SIGTERM, request_termination)
@@ -285,43 +310,45 @@ def train():
             total_reward += reward
             state_new = agent.get_state(game)
 
-            # 4. Online TD update + store in replay buffer
             agent.train_short_memory(state_old, final_move, reward, state_new, done)
             agent.remember(state_old, final_move, reward, state_new, done)
 
             # ── Mid-episode termination ──────────────────────────────────
             if termination_requested and not done:
-                print('Termination requested mid-episode. Saving checkpoint…',
+                print('Termination requested mid-episode. Exiting without a checkpoint.',
                       flush=True)
-                save_checkpoint_atomic(agent, metadata={
-                    'record': record,
-                    'n_games': agent.n_games,
-                    'terminated': True,
-                    'termination_signal': termination_signal,
-                })
-                print('Final checkpoint saved. Exiting.', flush=True)
                 break
 
             # ── Episode finished ─────────────────────────────────────────
             if done:
-                print(f'\n\nFinished with reward {total_reward:.1f}')
+                episode_reward = total_reward
+                print(f'\n\nFinished with reward {episode_reward:.1f}')
                 total_reward = 0
                 game.reset()
                 agent.n_games += 1
-
-                # Experience replay
+                games_this_run += 1
                 agent.train_long_memory()
 
                 if score > record:
                     record = score
 
-                # Save checkpoint every SAVE_EVERY games or on new record
-                if score >= record or agent.n_games % SAVE_EVERY == 0:
-                    save_checkpoint_atomic(agent, metadata={
-                        'record': record,
-                        'n_games': agent.n_games,
-                    })
-                    print(f'Saving model @ record: {record}')
+                new_highest_reward = episode_reward > agent.best_reward
+                if new_highest_reward:
+                    agent.best_reward = episode_reward
+                    save_checkpoint_atomic(
+                        agent,
+                        metadata={
+                            'record': record,
+                            'best_reward': agent.best_reward,
+                            'n_games': agent.n_games,
+                        },
+                        checkpoint_path=checkpoint_path,
+                    )
+                    print(f'New highest reward {episode_reward:.1f}. Saved checkpoint.')
+
+                run_limit_reached = (
+                    max_games is not None and games_this_run >= max_games
+                )
 
                 print(f'Game {agent.n_games}  Score {score}  Record: {record}  '
                       f'Eps: {agent.epsilon:.4f}')
@@ -333,25 +360,22 @@ def train():
                 plot(
                     plot_scores,
                     plot_mean_scores,
-                    csv_path='training_scores.csv',
+                    csv_path=csv_path,
                     png_path=None,
                     hidden=HIDE_PLOT,
+                    game_number_offset=game_number_offset,
                 )
 
                 if termination_requested:
-                    print('Termination requested. Episode completed and '
-                          'checkpoint saved. Exiting.', flush=True)
+                    print('Termination requested. Episode completed. Exiting.',
+                          flush=True)
+                    break
+                if run_limit_reached:
+                    print(f'Completed {games_this_run} game(s). Exiting.')
                     break
 
     except (KeyboardInterrupt, SystemExit):
-        print('\nTermination requested. Saving final checkpoint…')
-        save_checkpoint_atomic(agent, metadata={
-            'record': record,
-            'n_games': agent.n_games,
-            'terminated': True,
-            'termination_signal': termination_signal,
-        })
-        print('Final checkpoint saved. Exiting.')
+        print('\nTermination requested. Exiting without a checkpoint.')
     finally:
         try:
             import pygame
@@ -360,5 +384,42 @@ def train():
             pass
 
 
+def positive_int(value):
+    try:
+        parsed = int(value)
+    except ValueError as err:
+        raise argparse.ArgumentTypeError('must be a positive integer') from err
+    if parsed < 1:
+        raise argparse.ArgumentTypeError('must be a positive integer')
+    return parsed
+
+
 if __name__ == '__main__':
-    train()
+    parser = argparse.ArgumentParser(description='Train the Snake agent.')
+    parser.add_argument(
+        '--games',
+        type=positive_int,
+        help='number of complete games to run before exiting (default: unlimited)',
+    )
+    parser.add_argument(
+        '--checkpoint',
+        default=DEFAULT_CHECKPOINT_PATH,
+        help=f'checkpoint file to load and save (default: {DEFAULT_CHECKPOINT_PATH})',
+    )
+    parser.add_argument(
+        '--csv',
+        default=TRAINING_SCORES_CSV,
+        help=f'training score CSV path (default: {TRAINING_SCORES_CSV})',
+    )
+    parser.add_argument(
+        '--render',
+        action='store_true',
+        help='show the game window while training',
+    )
+    args = parser.parse_args()
+    train(
+        max_games=args.games,
+        checkpoint_path=args.checkpoint,
+        csv_path=args.csv,
+        render=args.render,
+    )
