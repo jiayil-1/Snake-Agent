@@ -14,7 +14,9 @@ from helper import plot
 
 # ── Hyperparameters ──────────────────────────────────────────────────────
 MAX_MEMORY = 100_000
-BATCH_SIZE = 1000
+BATCH_SIZE = 64
+REPLAY_WARMUP = 1000
+TRAIN_EVERY = 4
 LR = 1e-3
 GAMMA = 0.99
 EPSILON_START = 1.0
@@ -27,12 +29,21 @@ DEFAULT_CHECKPOINT_PATH = 'model/model.pth'
 class Agent:
 
     def __init__(self, board_width=640, board_height=480,
-                 checkpoint_path=DEFAULT_CHECKPOINT_PATH):
+                 checkpoint_path=DEFAULT_CHECKPOINT_PATH,
+                 replay_batch_size=BATCH_SIZE,
+                 replay_warmup=REPLAY_WARMUP,
+                 train_every=TRAIN_EVERY):
+        if replay_batch_size < 1 or replay_warmup < 1 or train_every < 1:
+            raise ValueError('Replay batch size, warmup, and train interval must be positive')
         self.n_games = 0
         self.record = 0
         self.best_reward = float('-inf')
         self.epsilon = EPSILON_START
         self.gamma = GAMMA
+        self.replay_batch_size = replay_batch_size
+        self.replay_warmup = replay_warmup
+        self.train_every = train_every
+        self.environment_steps = 0
         self.board_width = board_width
         self.board_height = board_height
         self.grid_width = self.board_width // BLOCK_SIZE
@@ -92,9 +103,27 @@ class Agent:
             scheduler_state = checkpoint.get('scheduler_state_dict')
             if scheduler_state is not None and hasattr(self.trainer, 'scheduler'):
                 try:
+                    scheduler_state = dict(scheduler_state)
+                    old_step_size = scheduler_state.get('step_size')
+                    new_step_size = self.trainer.scheduler.step_size
+                    if old_step_size and old_step_size != new_step_size:
+                        old_last_epoch = scheduler_state.get('last_epoch', 0)
+                        scheduler_state['last_epoch'] = (
+                            old_last_epoch * new_step_size // old_step_size
+                        )
+                        scheduler_state['_step_count'] = (
+                            scheduler_state['last_epoch'] + 1
+                        )
+                        scheduler_state['step_size'] = new_step_size
                     self.trainer.scheduler.load_state_dict(scheduler_state)
                 except ValueError as err:
                     print(f'Scheduler state mismatch ({err}). Continuing with fresh scheduler state.')
+
+            training_state = checkpoint.get('training_state', {})
+            self.environment_steps = training_state.get('environment_steps', 0)
+            self.trainer.optimizer_steps = training_state.get(
+                'optimizer_steps', self.trainer.scheduler.last_epoch,
+            )
 
             metadata = checkpoint.get('metadata', {})
             print('Loaded checkpoint metadata:', metadata)
@@ -195,19 +224,22 @@ class Agent:
     # ── Replay buffer interface ──────────────────────────────────────────
     def remember(self, state, action, reward, next_state, done):
         self.memory.append((state, action, reward, next_state, done))
+        self.environment_steps += 1
 
     def train_long_memory(self):
-        """Sample a batch from replay buffer and train."""
-        if len(self.memory) > BATCH_SIZE:
-            mini_sample = random.sample(self.memory, BATCH_SIZE)
-        else:
-            mini_sample = list(self.memory)
+        """Train one replay minibatch when warmup and update cadence are met."""
+        if len(self.memory) < max(self.replay_warmup, self.replay_batch_size):
+            return False
+        if self.environment_steps % self.train_every != 0:
+            return False
 
+        mini_sample = random.sample(self.memory, self.replay_batch_size)
         states, actions, rewards, next_states, dones = zip(*mini_sample)
         self.trainer.train_step(states, actions, rewards, next_states, dones)
+        return True
 
     def train_short_memory(self, state, action, reward, next_state, done):
-        """Train on a single transition (online TD update)."""
+        """Keep the legacy immediate single-transition update API available."""
         self.trainer.train_step(state, action, reward, next_state, done)
 
     def get_action(self, state):
@@ -242,6 +274,10 @@ def save_checkpoint_atomic(agent, metadata=None,
         'model_state_dict': agent.model.state_dict(),
         'optimizer_state_dict': agent.trainer.optimizer.state_dict(),
         'scheduler_state_dict': agent.trainer.scheduler.state_dict(),
+        'training_state': {
+            'environment_steps': agent.environment_steps,
+            'optimizer_steps': agent.trainer.optimizer_steps,
+        },
         'metadata': checkpoint_metadata,
     }
 
@@ -310,8 +346,9 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
             total_reward += reward
             state_new = agent.get_state(game)
 
-            agent.train_short_memory(state_old, final_move, reward, state_new, done)
+            # Keep each transition and train from replay at the configured cadence.
             agent.remember(state_old, final_move, reward, state_new, done)
+            agent.train_long_memory()
 
             # ── Mid-episode termination ──────────────────────────────────
             if termination_requested and not done:
@@ -327,7 +364,6 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
                 game.reset()
                 agent.n_games += 1
                 games_this_run += 1
-                agent.train_long_memory()
 
                 if score > record:
                     record = score

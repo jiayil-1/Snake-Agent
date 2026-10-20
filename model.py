@@ -112,7 +112,7 @@ class QTrainer:
         lr,
         gamma,
         max_grad_norm=5.0,
-        lr_step_size=2000,
+        lr_step_size=500,
         lr_decay=0.95,
         min_lr=1e-5,
     ):
@@ -130,13 +130,33 @@ class QTrainer:
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
         self.scheduler = optim.lr_scheduler.StepLR(
             self.optimizer,
+            # Replay updates happen every four environment moves by default.
+            # 500 optimizer updates retain the prior ~2000-move decay cadence.
             step_size=lr_step_size,
             gamma=lr_decay,
         )
         self.criterion = nn.MSELoss()
+        self.optimizer_steps = 0
 
     def current_lr(self):
         return self.optimizer.param_groups[0]['lr']
+
+    @staticmethod
+    def build_td_target(predictions, actions, rewards, next_q_values, dones, gamma):
+        """Build DQN targets while changing only the action selected per row."""
+        action_indices = torch.argmax(actions, dim=1)
+        done_mask = torch.as_tensor(
+            dones,
+            dtype=predictions.dtype,
+            device=predictions.device,
+        )
+        max_next_q = torch.max(next_q_values, dim=1).values
+        target_q = rewards + (1.0 - done_mask) * gamma * max_next_q
+
+        target = predictions.detach().clone()
+        row_indices = torch.arange(target.shape[0], device=target.device)
+        target[row_indices, action_indices] = target_q
+        return target
 
     def _to_state_tensor(self, state):
         if isinstance(state, dict):
@@ -171,15 +191,9 @@ class QTrainer:
         # TD target: r + γ·max Q(s', a')
         with torch.no_grad():
             next_q = self.model(next_state)
-            max_next_q = torch.max(next_q, dim=1).values
-            done_mask = torch.tensor(done, dtype=torch.float, device=self.device)
-            target_q = reward + (1.0 - done_mask) * self.gamma * max_next_q
-
-        # Only update the Q-value for the action taken
-        target = pred.clone().detach()
-        action_indices = torch.argmax(action, dim=1)
-        for idx in range(len(done)):
-            target[idx][action_indices[idx]] = target_q[idx]
+            target = self.build_td_target(
+                pred, action, reward, next_q, done, self.gamma,
+            )
 
         self.optimizer.zero_grad()
         loss = self.criterion(pred, target)
@@ -187,6 +201,7 @@ class QTrainer:
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
         self.optimizer.step()
         self.scheduler.step()
+        self.optimizer_steps += 1
 
         if self.min_lr is not None:
             for group in self.optimizer.param_groups:
