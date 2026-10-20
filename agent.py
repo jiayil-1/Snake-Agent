@@ -352,9 +352,8 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
             # ── Mid-episode termination ──────────────────────────────────
             if termination_requested and not done:
                 graceful_exit = True
-                message = ('Latest progress will be saved.' if best_checkpoint_path is not None
-                           else 'Exiting without a checkpoint.')
-                print(f'Termination requested mid-episode. {message}', flush=True)
+                print('Termination requested mid-episode. Latest progress will be saved.',
+                      flush=True)
                 break
 
             # ── Episode finished ─────────────────────────────────────────
@@ -423,12 +422,10 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
 
     except (KeyboardInterrupt, SystemExit):
         graceful_exit = True
-        message = ('Latest progress will be saved.' if best_checkpoint_path is not None
-                   else 'Exiting without a checkpoint.')
-        print(f'\nTermination requested. {message}')
+        print('\nTermination requested. Latest progress will be saved.')
     finally:
         try:
-            if graceful_exit and best_checkpoint_path is not None:
+            if graceful_exit:
                 save_checkpoint_atomic(agent, checkpoint_path=checkpoint_path)
         finally:
             for sig, handler in previous_handlers.items():

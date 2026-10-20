@@ -129,7 +129,7 @@ The original entrypoint remains available with its existing paths and best-rewar
 python agent.py
 ```
 
-Training continues until you stop it with `Ctrl+C` or send a termination signal. A checkpoint is saved only when a completed game achieves a higher cumulative reward than the best reward stored in the current checkpoint. If `model/model.pth` exists, training loads it and resumes from its saved model and metadata; otherwise, it starts with a fresh model. Older checkpoints do not include a cumulative reward, so the first completed game after this change establishes the baseline. The agent uses CUDA when available, then Apple GPU acceleration through MPS when available, and CPU otherwise. Stopping or reaching a game limit does not force a checkpoint save.
+Training continues until you stop it with `Ctrl+C` or send a termination signal. A checkpoint is saved when a completed game achieves a higher cumulative reward than the best reward stored in the current checkpoint, and the latest progress is also saved whenever training exits gracefully. This includes updates made during an unfinished episode. If `model/model.pth` exists, training loads it and resumes from its saved model and metadata; otherwise, it starts with a fresh model. Older checkpoints do not include a cumulative reward, so the first completed game after this change establishes the baseline. The agent uses CUDA when available, then Apple GPU acceleration through MPS when available, and CPU otherwise. Abrupt termination can only recover the last saved checkpoint.
 
 Each move's state, action, immediate reward, next state, and terminal flag are stored in replay memory. Once the buffer has 1,000 transitions, the agent samples a 64-transition minibatch every four environment moves. A transition's reward is used only for its own TD target; the episode's cumulative reward is used for checkpoint selection. After warmup, the learning-rate schedule decays every 500 minibatch updates, about 2,000 environment moves at the default cadence. Existing checkpoints keep their current learning rate and converted scheduler phase. Exploration still decays by completed episode.
 
@@ -139,7 +139,7 @@ Use command-line options to limit a run, choose the checkpoint and score CSV pat
 python agent.py --games 1000 --checkpoint model/experiment.pth --csv output/scores.csv --render
 ```
 
-`--games` counts complete games in this run and exits after that many games. A checkpoint is written only if one of those games achieves a new highest cumulative reward. If omitted, training runs until stopped. The `--checkpoint`, `--csv`, and `--render` options are also optional; their defaults preserve the behavior above.
+`--games` counts complete games in this run and exits after that many games, saving the latest checkpoint before exit. If omitted, training runs until stopped and saves on graceful exit. The `--checkpoint`, `--csv`, and `--render` options are also optional; their defaults preserve the behavior above.
 
 Use `--reset-epsilon` to start the run with epsilon at `1.0`; it then decays by completed game as usual. This preserves the loaded model and cumulative game number.
 
