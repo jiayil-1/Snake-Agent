@@ -361,6 +361,7 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
             # ── Episode finished ─────────────────────────────────────────
             if done:
                 episode_reward = total_reward
+                end_reason = game.end_reason
                 print(f'\n\nFinished with reward {episode_reward:.1f}')
                 total_reward = 0
                 game.reset()
@@ -388,7 +389,8 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
                     max_games is not None and games_this_run >= max_games
                 )
 
-                print(f'Game {agent.n_games}  Score {score}  Record: {record}  '
+                print(f'Game {agent.n_games}  Score {score}  '
+                      f'End reason: {end_reason}  Record: {record}  '
                       f'Eps: {agent.epsilon:.4f}')
 
                 plot_scores.append(score)
@@ -402,6 +404,7 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
                     png_path=None,
                     hidden=HIDE_PLOT,
                     game_number_offset=game_number_offset,
+                    end_reason=end_reason,
                 )
 
                 if termination_requested:

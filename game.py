@@ -63,6 +63,7 @@ class SnakeGameAI:
         self.food = None
         self._place_food()
         self.frame_iteration = 0
+        self.end_reason = None
 
 
     def _place_food(self):
@@ -95,12 +96,16 @@ class SnakeGameAI:
         # 3. check if game over
         game_over = False
         if self.frame_iteration > 50*len(self.snake):
-            print(f'DIED BY TIMEOUT')
             game_over = True
+            self.end_reason = 'timeout'
             reward += TIMEOUT_PENALTY
             return reward, game_over, self.score
         if self.is_collision():
             game_over = True
+            self.end_reason = (
+                'self-collision' if self.head in self.snake[1:]
+                else 'wall-collision'
+            )
             reward += COLLISION_PENALTY
             return reward, game_over, self.score
 

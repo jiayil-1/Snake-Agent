@@ -2,8 +2,31 @@ import matplotlib.pyplot as plt
 import csv
 import os
 
+
+def _ensure_end_reason_column(csv_path):
+    csv_path = os.fspath(csv_path)
+    with open(csv_path, newline='') as csv_file:
+        rows = list(csv.reader(csv_file))
+
+    if not rows or 'end_reason' in rows[0]:
+        return
+
+    rows[0].append('end_reason')
+    rows[1:] = [row + [''] for row in rows[1:]]
+
+    temp_path = f'{csv_path}.tmp.{os.getpid()}'
+    try:
+        with open(temp_path, 'w', newline='') as csv_file:
+            csv.writer(csv_file).writerows(rows)
+        os.chmod(temp_path, os.stat(csv_path).st_mode & 0o777)
+        os.replace(temp_path, csv_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
 def plot(scores, mean_scores, csv_path=None, png_path=None, hidden=True,
-         game_number_offset=0):
+         game_number_offset=0, end_reason=''):
     if hidden:
         plt.ioff()
         fig, ax = plt.subplots()
@@ -33,13 +56,15 @@ def plot(scores, mean_scores, csv_path=None, png_path=None, hidden=True,
         file_exists = os.path.exists(csv_path)
         file_is_empty = (not file_exists) or os.path.getsize(csv_path) == 0
 
-        with open(csv_path, 'a', newline='') as csv_file:
-            writer = csv.writer(csv_file)
-            if file_is_empty:
-                writer.writerow(['game', 'score'])
+        if file_is_empty:
+            with open(csv_path, 'a', newline='') as csv_file:
+                csv.writer(csv_file).writerow(['game', 'score', 'end_reason'])
+        else:
+            _ensure_end_reason_column(csv_path)
 
-            game_index = game_number_offset + len(scores)
-            writer.writerow([game_index, scores[-1]])
+        game_index = game_number_offset + len(scores)
+        with open(csv_path, 'a', newline='') as csv_file:
+            csv.writer(csv_file).writerow([game_index, scores[-1], end_reason])
 
     if png_path:
         if hidden:
