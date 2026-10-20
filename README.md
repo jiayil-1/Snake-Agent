@@ -30,13 +30,15 @@ Training continues until you stop it with `Ctrl+C` or send a termination signal.
 
 Each move's state, action, immediate reward, next state, and terminal flag are stored in replay memory. Once the buffer has 1,000 transitions, the agent samples a 64-transition minibatch every four environment moves. A transition's reward is used only for its own TD target; the episode's cumulative reward is used for checkpoint selection. After warmup, the learning-rate schedule decays every 500 minibatch updates, about 2,000 environment moves at the default cadence. Existing checkpoints keep their current learning rate and converted scheduler phase. Exploration still decays by completed episode.
 
-Use command-line options to limit a run, choose the checkpoint and score CSV paths, or show the game window:
+Use command-line options to limit a run, choose the checkpoint and score CSV paths, reset exploration epsilon, or show the game window:
 
 ```bash
 python agent.py --games 1000 --checkpoint model/experiment.pth --csv output/scores.csv --render
 ```
 
 `--games` counts complete games in this run and exits after that many games. A checkpoint is written only if one of those games achieves a new highest cumulative reward. If omitted, training runs until stopped. The `--checkpoint`, `--csv`, and `--render` options are also optional; their defaults preserve the behavior above.
+
+Use `--reset-epsilon` to start the run with epsilon at `1.0`; it then decays by completed game as usual. This preserves the loaded model and cumulative game number.
 
 Run from the repository directory because the checkpoint and score paths are relative to the current working directory. Training appends each game's number, score, and ending reason to `training_scores.csv`, and prints the ending reason in the command-line game summary. The reason is `timeout`, `self-collision`, or `wall-collision`. Existing rows keep their game and score values and have a blank ending reason because their causes were not recorded. On startup, the agent reads the final logged game number and continues numbering from there. The plotter calculates the rolling mean from the scores when it generates the chart. Move or rename the CSV before a run if you want a separate log that starts at game 1.
 

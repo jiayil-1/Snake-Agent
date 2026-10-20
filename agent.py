@@ -20,8 +20,8 @@ TRAIN_EVERY = 4
 LR = 1e-3
 GAMMA = 0.99
 EPSILON_START = 1.0
-EPSILON_MIN = 0.01
-EPSILON_DECAY = 0.998
+EPSILON_MIN = 0.001
+EPSILON_DECAY = 0.997
 HIDE_PLOT = True
 TRAINING_SCORES_CSV = 'training_scores.csv'
 DEFAULT_CHECKPOINT_PATH = 'model/model.pth'
@@ -36,6 +36,7 @@ class Agent:
         if replay_batch_size < 1 or replay_warmup < 1 or train_every < 1:
             raise ValueError('Replay batch size, warmup, and train interval must be positive')
         self.n_games = 0
+        self.epsilon_start_game = 0
         self.record = 0
         self.best_reward = float('-inf')
         self.epsilon = EPSILON_START
@@ -130,10 +131,8 @@ class Agent:
             self.record = metadata.get('record', 0)
             self.best_reward = metadata.get('best_reward', float('-inf'))
             self.n_games = metadata.get('n_games', 0)
-            self.epsilon = max(
-                EPSILON_MIN,
-                EPSILON_START * (EPSILON_DECAY ** self.n_games),
-            )
+            self.epsilon_start_game = metadata.get('epsilon_start_game', 0)
+            self._update_epsilon()
             print(f'Loading agent with record {self.record}, n_games {self.n_games}, '
                   f'epsilon {self.epsilon:.4f}')
         else:
@@ -246,7 +245,7 @@ class Agent:
 
     def get_action(self, state):
         """Epsilon-greedy action selection."""
-        self.epsilon = max(EPSILON_MIN, EPSILON_START * (EPSILON_DECAY ** self.n_games))
+        self._update_epsilon()
         final_move = [0, 0, 0]
         if random.random() < self.epsilon:
             move = random.randint(0, 2)
@@ -258,6 +257,13 @@ class Agent:
             move = int(torch.argmax(prediction).item())
             final_move[move] = 1
         return final_move
+
+    def _update_epsilon(self):
+        games_since_reset = max(0, self.n_games - self.epsilon_start_game)
+        self.epsilon = max(
+            EPSILON_MIN,
+            EPSILON_START * (EPSILON_DECAY ** games_since_reset),
+        )
 
 
 def save_checkpoint_atomic(agent, metadata=None,
@@ -306,7 +312,7 @@ def read_last_game_number(csv_path=TRAINING_SCORES_CSV):
 
 
 def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
-          csv_path=TRAINING_SCORES_CSV, render=False):
+          csv_path=TRAINING_SCORES_CSV, render=False, reset_epsilon=False):
     plot_scores = []
     plot_mean_scores = []
     recent_scores = deque(maxlen=100)
@@ -318,6 +324,10 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
         board_height=game.h,
         checkpoint_path=checkpoint_path,
     )
+    if reset_epsilon:
+        agent.epsilon_start_game = agent.n_games
+        agent.epsilon = EPSILON_START
+        print('Epsilon reset to 1.0000 for this run.')
     record = agent.record
     games_this_run = 0
     total_reward = 0
@@ -380,6 +390,7 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
                             'record': record,
                             'best_reward': agent.best_reward,
                             'n_games': agent.n_games,
+                            'epsilon_start_game': agent.epsilon_start_game,
                         },
                         checkpoint_path=checkpoint_path,
                     )
@@ -457,10 +468,16 @@ if __name__ == '__main__':
         action='store_true',
         help='show the game window while training',
     )
+    parser.add_argument(
+        '--reset-epsilon',
+        action='store_true',
+        help='reset exploration epsilon to 1.0 for this run',
+    )
     args = parser.parse_args()
     train(
         max_games=args.games,
         checkpoint_path=args.checkpoint,
         csv_path=args.csv,
         render=args.render,
+        reset_epsilon=args.reset_epsilon,
     )
