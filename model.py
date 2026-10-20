@@ -6,11 +6,26 @@ import os
 from datetime import datetime
 
 
+class ResidualBlock(nn.Module):
+    """Two convolutions with an identity shortcut."""
+
+    def __init__(self, channels=32):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        residual = self.conv2(self.relu(self.conv1(x)))
+        return self.relu(x + residual)
+
+
 class Linear_QNet(nn.Module):
-    """Simple DQN: 2-layer CNN + metadata MLP → 2 fusion linear layers → Q-values.
+    """DQN: pooled residual CNN with a pooled stem skip + metadata MLP.
 
     Board input: 3 channels (head, food, body), binary 0/1, native grid size.
-    CNN: Conv(3→16) → ReLU → MaxPool → Conv(16→32) → ReLU → MaxPool → flatten → Linear → 128
+    CNN: Conv(3→32) → ReLU → 2x MaxPool → 3 residual blocks + pooled skip
+         → flatten → Linear → 128
     Metadata: Linear → 64
     Fusion: Linear(192→128) → ReLU → Linear(128→output_size)
     """
@@ -22,22 +37,22 @@ class Linear_QNet(nn.Module):
         self.metadata_size = metadata_size
         self.output_size = output_size
 
-        # -- CNN: 2 conv layers with 16 and 32 output channels -------------
+        # Keep this module layout stable for existing checkpoint weights.
         self.cnn = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, padding=1),
+            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(2),  # → H/2 × W/2
-
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),  # → H/4 × W/4
+            ResidualBlock(),
+            ResidualBlock(),
+            ResidualBlock(),
         )
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.skip_relu = nn.ReLU()
 
-        cnn_h = board_height // 4
-        cnn_w = board_width // 4
-        cnn_flat = 32 * max(cnn_h, 1) * max(cnn_w, 1)
+        cnn_height = board_height // 4
+        cnn_width = board_width // 4
+        cnn_flat = 32 * cnn_height * cnn_width
 
-        # Downsample to 128 features
+        # Project the pooled board features to 128 features.
         self.cnn_fc = nn.Sequential(
             nn.Linear(cnn_flat, 128),
             nn.ReLU(),
@@ -65,7 +80,11 @@ class Linear_QNet(nn.Module):
         if metadata.dim() == 1:
             metadata = metadata.unsqueeze(0)
 
-        cnn_out = self.cnn(board_state)
+        # Keep an encoder skip at the same spatial size as the residual blocks.
+        skip = self.cnn[:2](board_state)
+        pooled_skip = self.pool(self.pool(skip))
+        cnn_out = self.cnn[2:](pooled_skip)
+        cnn_out = self.skip_relu(cnn_out + pooled_skip)
         cnn_out = torch.flatten(cnn_out, 1)
         board_emb = self.cnn_fc(cnn_out)
 
@@ -100,7 +119,11 @@ class QTrainer:
         self.lr = lr
         self.gamma = gamma
         self.min_lr = min_lr
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(
+            "cuda" if torch.cuda.is_available()
+            else "mps" if torch.backends.mps.is_available()
+            else "cpu"
+        )
         print(f'Using {self.device} to train')
         self.model = model.to(self.device)
         self.max_grad_norm = max_grad_norm

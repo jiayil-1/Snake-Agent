@@ -3,6 +3,7 @@ import random
 import numpy as np
 import os
 import signal
+from copy import deepcopy
 from datetime import datetime
 from collections import deque
 from game import SnakeGameAI, Direction, Point, BLOCK_SIZE
@@ -17,8 +18,8 @@ GAMMA = 0.99
 EPSILON_START = 1.0
 EPSILON_MIN = 0.01
 EPSILON_DECAY = 0.998
-SAVE_EVERY = 100           # periodic checkpoint every N games
 HIDE_PLOT = True
+SAVE_EVERY = 100
 
 class Agent:
 
@@ -37,7 +38,11 @@ class Agent:
         # Metadata: 4 dir + 3 danger + 4 food_dir + 1 food_dist = 12
         self.metadata_size = 12
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(
+            "cuda" if torch.cuda.is_available()
+            else "mps" if torch.backends.mps.is_available()
+            else "cpu"
+        )
 
         self.model = Linear_QNet(
             board_height=self.grid_height,
@@ -59,13 +64,19 @@ class Agent:
             print(f'No checkpoint found at {checkpoint_path}. Starting with a fresh model.')
             return
 
-        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            try:
-                self.model.load_state_dict(checkpoint['model_state_dict'])
-            except RuntimeError as err:
-                print(f'Checkpoint architecture mismatch ({err}). Starting with a fresh model.')
-                return
+        wrapped = isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint
+        model_state = checkpoint['model_state_dict'] if wrapped else checkpoint
+        # Strict loading can copy matching tensors before reporting a mismatch.
+        # Validate on a copy so rejected checkpoints never alter the live model.
+        candidate = deepcopy(self.model)
+        try:
+            candidate.load_state_dict(model_state)
+        except RuntimeError as err:
+            print(f'Checkpoint architecture mismatch ({err}). Starting with a fresh model.')
+            return
+        self.model.load_state_dict(candidate.state_dict())
 
+        if wrapped:
             optimizer_state = checkpoint.get('optimizer_state_dict')
             if optimizer_state is not None:
                 try:
@@ -91,11 +102,6 @@ class Agent:
             print(f'Loading agent with record {self.record}, n_games {self.n_games}, '
                   f'epsilon {self.epsilon:.4f}')
         else:
-            try:
-                self.model.load_state_dict(checkpoint)
-            except RuntimeError as err:
-                print(f'Legacy checkpoint architecture mismatch ({err}). Starting with a fresh model.')
-                return
             print('Loaded legacy checkpoint (no metadata found).')
 
     # ── State representation ─────────────────────────────────────────────
