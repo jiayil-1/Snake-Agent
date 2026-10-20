@@ -15,7 +15,7 @@ import numpy as np
 from torch import nn
 
 from agent import Agent, save_checkpoint_atomic
-from game import SnakeGameAI
+from game import Direction, Point, SnakeGameAI
 from model import Linear_QNet, QTrainer
 
 
@@ -278,6 +278,62 @@ class ResidualModelTests(unittest.TestCase):
                     self.assertEqual((agent.record, agent.n_games, agent.epsilon), (0, 0, 1.0))
                     self.assertEqual(path.read_bytes(), original_bytes)
                     self.assertEqual(len(agent.trainer.optimizer.state), 0)
+
+
+class RewardConfigurationTests(unittest.TestCase):
+    def setUp(self):
+        self.rewards = {
+            'step_penalty': -2,
+            'progress_reward': 3,
+            'progress_penalty': -4,
+            'food_reward': 7,
+            'collision_penalty': -13,
+            'timeout_penalty': -9,
+        }
+
+    def prepare_game(self, game, head, food):
+        game.head = head
+        game.snake = [head, Point(head.x - 20, head.y), Point(head.x - 40, head.y)]
+        game.direction = Direction.RIGHT
+        game.food = food
+        game.score = 0
+        game.frame_iteration = 0
+
+    def test_custom_rewards_apply_per_environment_and_do_not_mutate_defaults(self):
+        custom = SnakeGameAI(w=200, h=200, render=False, rewards=self.rewards)
+        default = SnakeGameAI(w=200, h=200, render=False)
+        self.prepare_game(custom, Point(100, 100), Point(0, 0))
+        self.prepare_game(default, Point(100, 100), Point(0, 0))
+
+        custom_reward, custom_done, _ = custom.play_step([1, 0, 0])
+        default_reward, default_done, _ = default.play_step([1, 0, 0])
+
+        self.assertFalse(custom_done)
+        self.assertFalse(default_done)
+        self.assertEqual(custom_reward, -6)
+        self.assertEqual(default_reward, -0.01)
+        self.assertEqual(SnakeGameAI(render=False).rewards['food_reward'], 10)
+
+    def test_food_progress_collision_and_timeout_rewards(self):
+        game = SnakeGameAI(w=200, h=200, render=False, rewards=self.rewards)
+        self.prepare_game(game, Point(100, 100), Point(140, 100))
+        self.assertEqual(game.play_step([1, 0, 0])[0], 1)
+
+        self.prepare_game(game, Point(100, 100), Point(120, 100))
+        food_reward, done, score = game.play_step([1, 0, 0])
+        self.assertEqual((food_reward, done, score), (5, False, 1))
+
+        self.prepare_game(game, Point(100, 100), Point(180, 0))
+        game.head = Point(0, 100)
+        game.snake = [game.head, Point(20, 100), Point(40, 100)]
+        game.direction = Direction.LEFT
+        self.assertEqual(game.play_step([1, 0, 0])[:2], (-15, True))
+        self.assertEqual(game.end_reason, 'wall-collision')
+
+        self.prepare_game(game, Point(100, 100), Point(0, 0))
+        game.frame_iteration = 100 * len(game.snake)
+        self.assertEqual(game.play_step([1, 0, 0])[:2], (-11, True))
+        self.assertEqual(game.end_reason, 'timeout')
 
 
 if __name__ == '__main__':

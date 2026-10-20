@@ -7,7 +7,9 @@ import math
 from pathlib import Path
 import re
 
-from model import ARCHITECTURES, ARCHITECTURE_DEFAULTS
+from model import ARCHITECTURES, ARCHITECTURE_DEFAULTS, ARCHITECTURE_CAPABILITIES
+from reward_defaults import DEFAULT_REWARDS
+from state import resolve_state_representation, STATE_ENCODERS
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -54,7 +56,10 @@ def _object(value, label, allowed):
 
 def resolve_preset(preset):
     """Return a new, complete configuration; never mutate the supplied preset."""
-    _object(preset, 'preset', {'architecture', 'architecture_options', 'training'})
+    _object(preset, 'preset', {
+        'architecture', 'architecture_options', 'training',
+        'state_representation', 'rewards',
+    })
     architecture = preset.get('architecture')
     if not isinstance(architecture, str) or architecture not in ARCHITECTURES:
         raise ValueError(f'Unknown architecture {architecture!r}; choose from {", ".join(ARCHITECTURES)}')
@@ -67,6 +72,23 @@ def resolve_preset(preset):
         sizes = options['hidden_sizes']
         if not isinstance(sizes, list) or not sizes or any(type(n) is not int or n < 1 for n in sizes):
             raise ValueError('hidden_sizes must be a nonempty array of positive integers')
+    if architecture == 'residual_cnn':
+        for name in ('channels', 'residual_blocks', 'board_embedding_size',
+                     'metadata_embedding_size', 'fusion_hidden_size'):
+            if type(options[name]) is not int or options[name] < 1:
+                raise ValueError(f'{name} must be a positive integer')
+
+    state_representation = resolve_state_representation(preset.get('state_representation'))
+    if (ARCHITECTURE_CAPABILITIES[architecture]['requires_board']
+            and STATE_ENCODERS[state_representation['encoder']]['board_channels'] == 0):
+        raise ValueError(f'{architecture} requires a state encoder with board input')
+
+    rewards = preset.get('rewards', {})
+    _object(rewards, 'rewards', DEFAULT_REWARDS.keys())
+    rewards = DEFAULT_REWARDS | rewards
+    for name, value in rewards.items():
+        if type(value) not in (int, float) or not math.isfinite(value):
+            raise ValueError(f'{name} must be a finite number')
 
     training = preset.get('training', {})
     _object(training, 'training', DEFAULT_TRAINING.keys())
@@ -94,7 +116,13 @@ def resolve_preset(preset):
         raise ValueError('max_memory must accommodate replay_batch_size and replay_warmup')
     if training['min_lr'] is not None and training['min_lr'] > training['lr']:
         raise ValueError('min_lr cannot exceed lr')
-    return {'architecture': architecture, 'architecture_options': options, 'training': training}
+    return {
+        'architecture': architecture,
+        'state_representation': state_representation,
+        'rewards': rewards,
+        'architecture_options': options,
+        'training': training,
+    }
 
 
 def _unique_object(pairs):

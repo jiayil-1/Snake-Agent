@@ -8,7 +8,7 @@ import pickle
 import shutil
 import tempfile
 
-from configuration import REPO_ROOT, load_presets, positive_int, validate_name
+from configuration import REPO_ROOT, load_presets, positive_int, resolve_preset, validate_name
 from model import resolve_device
 
 
@@ -21,7 +21,11 @@ def prepare_run(config, run_dir, device):
     if run_dir.exists() and not run_dir.is_dir():
         raise ValueError(f'Run path is not a directory: {run_dir}')
     if snapshot.exists():
-        if json.loads(snapshot.read_text()) != config:
+        try:
+            saved_config = resolve_preset(json.loads(snapshot.read_text()))
+        except ValueError as err:
+            raise ValueError(f'Run configuration is invalid: {err}') from err
+        if saved_config != config:
             raise ValueError('Run configuration differs from this preset; use a new --run name')
         if not latest.exists() and (run_dir / 'best.pth').exists():
             raise ValueError('Run is missing latest.pth; restore it before resuming')

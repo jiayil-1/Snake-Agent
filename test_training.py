@@ -20,6 +20,7 @@ import torch
 
 from configuration import load_presets, resolve_preset
 from model import ARCHITECTURES, QTrainer
+from state import encode_state, get_observation_spec
 
 
 class ConfigurationTests(unittest.TestCase):
@@ -32,6 +33,11 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(cnn['training']['train_every'], 4)
         self.assertEqual(cnn['training']['lr_step_size'], 500)
         self.assertEqual(presets['mlp']['architecture_options']['hidden_sizes'], [128, 128])
+        self.assertEqual(cnn['state_representation'], {
+            'encoder': 'board_metadata', 'options': {'body_encoding': 'gradient'},
+        })
+        self.assertEqual(cnn['rewards']['food_reward'], 10)
+        self.assertEqual(cnn['architecture_options']['channels'], 32)
         self.assertEqual(resolve_preset(cnn), cnn)
 
     def test_invalid_presets_fail(self):
@@ -49,6 +55,14 @@ class ConfigurationTests(unittest.TestCase):
             {'architecture': 'mlp', 'architecture_options': {'hidden_sizes': []}},
             {'architecture': 'mlp', 'architecture_options': {'hidden_sizes': [128, -1]}},
             {'architecture': 'residual_cnn', 'architecture_options': {'hidden_sizes': [128]}},
+            {'architecture': 'mlp', 'state_representation': {'encoder': 'unknown'}},
+            {'architecture': 'mlp', 'state_representation': {
+                'encoder': 'board_metadata', 'options': {'body_encoding': 'other'},
+            }},
+            {'architecture': 'residual_cnn', 'state_representation': {'encoder': 'metadata_only'}},
+            {'architecture': 'mlp', 'rewards': {'food_reward': float('inf')}},
+            {'architecture': 'mlp', 'architecture_options': {'hidden_sizes': [4], 'unused': 1}},
+            {'architecture': 'residual_cnn', 'architecture_options': {'residual_blocks': 0}},
         ]
         for preset in bad_presets:
             with self.subTest(preset=preset), self.assertRaises(ValueError):
@@ -89,6 +103,87 @@ class ArchitectureTests(unittest.TestCase):
                 self.assertTrue(any(not torch.equal(before[key], value)
                                     for key, value in model.state_dict().items()))
                 self.assertTrue(all(torch.isfinite(p).all() for p in model.parameters()))
+
+    def test_state_encoders_expose_only_their_required_inputs(self):
+        from game import SnakeGameAI
+
+        game = SnakeGameAI(render=False)
+        gradient_config = resolve_preset({'architecture': 'mlp'})
+        gradient = encode_state(gradient_config['state_representation'], game, 32, 24)
+        self.assertEqual(set(gradient), {'board_state', 'metadata'})
+        self.assertEqual(gradient['board_state'].shape, (3, 24, 32))
+        self.assertEqual(gradient['metadata'].shape, (12,))
+        expected_board = np.zeros((3, 24, 32), dtype=np.float32)
+        head = game.snake[0]
+        expected_board[0, 12, 16] = 1.0
+        expected_board[1, int(game.food.y // 20), int(game.food.x // 20)] = 1.0
+        expected_board[2, 12, 16] = 1.0
+        expected_board[2, 12, 15] = 0.5
+        expected_metadata = np.array([
+            0, 1, 0, 0, 0, 0, 0,
+            int(game.food.x < head.x), int(game.food.x > head.x),
+            int(game.food.y < head.y), int(game.food.y > head.y),
+            (abs(head.x - game.food.x) + abs(head.y - game.food.y)) / (20 * 56),
+        ], dtype=np.float32)
+        np.testing.assert_array_equal(gradient['board_state'], expected_board)
+        np.testing.assert_allclose(gradient['metadata'], expected_metadata)
+
+        binary_config = resolve_preset({
+            'architecture': 'mlp',
+            'state_representation': {
+                'encoder': 'board_metadata', 'options': {'body_encoding': 'binary'},
+            },
+        })
+        binary = encode_state(binary_config['state_representation'], game, 32, 24)
+        self.assertEqual(set(np.unique(binary['board_state'][2])), {0.0, 1.0})
+        self.assertEqual(binary['board_state'][2].sum(), len(game.snake))
+        self.assertTrue(np.all(gradient['board_state'][2] <= 1.0))
+        self.assertTrue(np.any((gradient['board_state'][2] > 0) & (gradient['board_state'][2] < 1)))
+
+        compact_config = resolve_preset({
+            'architecture': 'mlp', 'state_representation': {'encoder': 'metadata_only'},
+        })
+        compact = encode_state(compact_config['state_representation'], game, 32, 24)
+        self.assertEqual(set(compact), {'metadata'})
+        np.testing.assert_array_equal(compact['metadata'], gradient['metadata'])
+        self.assertEqual(get_observation_spec(compact_config['state_representation'], 24, 32), {
+            'has_board': False, 'board_channels': 0, 'board_height': 0,
+            'board_width': 0, 'metadata_size': 12,
+        })
+
+    def test_network_options_and_metadata_only_training(self):
+        config = resolve_preset({
+            'architecture': 'mlp',
+            'architecture_options': {'hidden_sizes': [16, 8]},
+            'state_representation': {'encoder': 'metadata_only'},
+        })
+        spec = get_observation_spec(config['state_representation'], 24, 32)
+        model = ARCHITECTURES['mlp'](
+            24, 32, 12, 3, state_spec=spec, **config['architecture_options'],
+        )
+        state = {'metadata': np.arange(12, dtype=np.float32)}
+        self.assertEqual(model({key: torch.as_tensor(value) for key, value in state.items()}).shape, (1, 3))
+        trainer = QTrainer(model, lr=0.001, gamma=0.99, device='cpu')
+        trainer.train_step(state, [1, 0, 0], 1.0, state, True)
+        self.assertEqual(trainer.optimizer_steps, 1)
+
+        cnn_options = resolve_preset({
+            'architecture': 'residual_cnn',
+            'architecture_options': {
+                'channels': 16, 'residual_blocks': 2, 'board_embedding_size': 32,
+                'metadata_embedding_size': 8, 'fusion_hidden_size': 24,
+            },
+        })
+        cnn = ARCHITECTURES['residual_cnn'](
+            24, 32, 12, 3,
+            state_spec=get_observation_spec(cnn_options['state_representation'], 24, 32),
+            **cnn_options['architecture_options'],
+        )
+        output = cnn({
+            'board_state': torch.rand(2, 3, 24, 32),
+            'metadata': torch.rand(2, 12),
+        })
+        self.assertEqual(output.shape, (2, 3))
 
 
 class ConfiguredAgentTests(unittest.TestCase):
@@ -147,6 +242,23 @@ class ConfiguredAgentTests(unittest.TestCase):
 
 
 class CheckpointPolicyTests(unittest.TestCase):
+    def test_train_rejects_config_that_conflicts_with_agent_before_writing(self):
+        from agent import Agent, train
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            latest, best, csv = root / 'latest.pth', root / 'best.pth', root / 'scores.csv'
+            agent = Agent(config={'architecture': 'mlp'}, device='cpu', checkpoint_path=latest)
+            changed = resolve_preset({
+                'architecture': 'mlp', 'rewards': {'food_reward': 3},
+            })
+            with self.assertRaisesRegex(ValueError, 'differs from the supplied agent config'):
+                train(max_games=1, config=changed, agent=agent, checkpoint_path=latest,
+                      best_checkpoint_path=best, csv_path=csv)
+            self.assertFalse(latest.exists())
+            self.assertFalse(best.exists())
+            self.assertFalse(csv.exists())
+
     def test_latest_advances_without_replacing_best(self):
         from agent import Agent, train
         from game import SnakeGameAI
@@ -202,7 +314,8 @@ class TrainingCliTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
         source = Path(__file__).resolve().parent
-        for name in ('agent.py', 'model.py', 'game.py', 'helper.py', 'configuration.py', 'train.py'):
+        for name in ('agent.py', 'model.py', 'game.py', 'helper.py', 'configuration.py',
+                     'state.py', 'reward_defaults.py', 'train.py'):
             if (source / name).exists():
                 shutil.copy2(source / name, self.root / name)
         self.presets = {
@@ -229,10 +342,25 @@ class TrainingCliTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
 
+    def one_step_cli(self, *args):
+        import_args = repr(list(args))
+        code = f'''
+import agent
+import train
+class OneStepGame(agent.SnakeGameAI):
+    def play_step(self, action):
+        self.end_reason = 'test'
+        return self.rewards['step_penalty'], True, self.score
+agent.SnakeGameAI = OneStepGame
+train.main({import_args})
+'''
+        return self.cli(code=code)
+
     def test_cli_list_and_invalid_input_create_no_outputs(self):
         result = self.cli('--list')
         self.assertIn('residual_cnn', result.stdout)
         self.assertIn('mlp', result.stdout)
+        self.assertNotIn('pygame-ce', result.stdout)
         for args in [(), ('--model', 'unknown'), ('--model', 'mlp', '--run', '../outside')]:
             self.cli(*args, success=False)
         self.presets['mlp']['training']['typo'] = 1
@@ -278,6 +406,58 @@ class TrainingCliTests(unittest.TestCase):
         self.assertIn('architecture mismatch', error.stderr)
         self.assertEqual({p.name: p.read_bytes() for p in first.iterdir()}, before)
 
+    def test_metadata_only_nondefault_run_resumes_and_rejects_changes(self):
+        self.presets['metadata-exp'] = {
+            'architecture': 'mlp',
+            'state_representation': {'encoder': 'metadata_only'},
+            'rewards': {'step_penalty': -0.02, 'food_reward': 6},
+            'architecture_options': {'hidden_sizes': [16, 8]},
+            'training': {
+                'replay_batch_size': 1, 'replay_warmup': 1,
+                'train_every': 1, 'max_memory': 32,
+            },
+        }
+        self.write_presets()
+        self.one_step_cli('--model', 'metadata-exp', '--games', '1', '--device', 'cpu')
+        run = self.root / 'runs' / 'metadata-exp'
+        config = json.loads((run / 'config.json').read_text())
+        checkpoint = torch.load(run / 'latest.pth', weights_only=True)
+        self.assertEqual(config, checkpoint['config'])
+        self.assertEqual(config['state_representation']['encoder'], 'metadata_only')
+        self.assertEqual(config['rewards']['step_penalty'], -0.02)
+        self.assertEqual(checkpoint['model_state_dict']['layers.0.weight'].shape, (16, 12))
+
+        self.one_step_cli('--model', 'metadata-exp', '--games', '1', '--device', 'cpu')
+        resumed = torch.load(run / 'latest.pth', weights_only=True)
+        self.assertEqual(resumed['metadata']['n_games'], 2)
+        before = {path.name: path.read_bytes() for path in run.iterdir()}
+        self.presets['metadata-exp']['rewards']['food_reward'] = 7
+        self.write_presets()
+        error = self.cli('--model', 'metadata-exp', '--games', '1', success=False)
+        self.assertIn('new --run', error.stderr)
+        self.assertEqual({path.name: path.read_bytes() for path in run.iterdir()}, before)
+
+    def test_older_named_config_and_checkpoint_fill_default_axes_in_memory(self):
+        self.one_step_cli('--model', 'mlp', '--run', 'old-schema', '--games', '1', '--device', 'cpu')
+        run = self.root / 'runs' / 'old-schema'
+        old_config = json.loads((run / 'config.json').read_text())
+        old_config.pop('state_representation')
+        old_config.pop('rewards')
+        (run / 'config.json').write_text(json.dumps(old_config))
+
+        checkpoint = torch.load(run / 'latest.pth', weights_only=True)
+        checkpoint['config'].pop('state_representation')
+        checkpoint['config'].pop('rewards')
+        torch.save(checkpoint, run / 'latest.pth')
+        old_snapshot_bytes = (run / 'config.json').read_bytes()
+
+        self.one_step_cli('--model', 'mlp', '--run', 'old-schema', '--games', '1', '--device', 'cpu')
+        self.assertEqual((run / 'config.json').read_bytes(), old_snapshot_bytes)
+        resumed = torch.load(run / 'latest.pth', weights_only=True)
+        self.assertEqual(resumed['metadata']['n_games'], 2)
+        self.assertIn('state_representation', resumed['config'])
+        self.assertIn('rewards', resumed['config'])
+
     def test_legacy_import_preserves_sources_and_can_resume(self):
         from agent import Agent, save_checkpoint_atomic
 
@@ -294,6 +474,25 @@ class TrainingCliTests(unittest.TestCase):
 
         self.cli('--model', 'mlp', '--run', 'wrong', '--import-legacy', '--device', 'cpu', success=False)
         self.assertFalse((self.root / 'runs' / 'wrong').exists())
+        self.presets['custom-state'] = {
+            'architecture': 'residual_cnn',
+            'state_representation': {
+                'encoder': 'board_metadata', 'options': {'body_encoding': 'binary'},
+            },
+        }
+        self.write_presets()
+        error = self.cli('--model', 'custom-state', '--run', 'custom-state',
+                         '--import-legacy', '--device', 'cpu', success=False)
+        self.assertIn('nondefault state or rewards cannot be verified', error.stderr)
+        self.assertFalse((self.root / 'runs' / 'custom-state').exists())
+        self.presets['custom-rewards'] = {
+            'architecture': 'residual_cnn', 'rewards': {'food_reward': 12},
+        }
+        self.write_presets()
+        error = self.cli('--model', 'custom-rewards', '--run', 'custom-rewards',
+                         '--import-legacy', '--device', 'cpu', success=False)
+        self.assertIn('nondefault state or rewards cannot be verified', error.stderr)
+        self.assertFalse((self.root / 'runs' / 'custom-rewards').exists())
         self.cli('--model', 'residual_cnn', '--run', 'legacy', '--import-legacy', '--device', 'cpu')
         run = self.root / 'runs' / 'legacy'
         self.assertEqual((run / 'latest.pth').read_bytes(), originals[0])

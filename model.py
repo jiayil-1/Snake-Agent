@@ -31,45 +31,54 @@ class Linear_QNet(nn.Module):
     Fusion: Linear(192→128) → ReLU → Linear(128→output_size)
     """
 
-    def __init__(self, board_height, board_width, metadata_size, output_size):
+    def __init__(self, board_height, board_width, metadata_size, output_size,
+                 channels=32, residual_blocks=3, board_embedding_size=128,
+                 metadata_embedding_size=64, fusion_hidden_size=128,
+                 state_spec=None):
         super().__init__()
-        self.board_height = board_height
-        self.board_width = board_width
-        self.metadata_size = metadata_size
+        state_spec = state_spec or {
+            'has_board': True, 'board_channels': 3,
+            'board_height': board_height, 'board_width': board_width,
+            'metadata_size': metadata_size,
+        }
+        if not state_spec['has_board']:
+            raise ValueError('residual_cnn requires a state representation with board input')
+        if state_spec['board_height'] < 4 or state_spec['board_width'] < 4:
+            raise ValueError('residual_cnn requires board dimensions of at least 4 by 4')
+        self.board_height = state_spec['board_height']
+        self.board_width = state_spec['board_width']
+        self.metadata_size = state_spec['metadata_size']
         self.output_size = output_size
 
         # Keep this module layout stable for existing checkpoint weights.
-        self.cnn = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),
+        cnn_layers = [
+            nn.Conv2d(state_spec['board_channels'], channels, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
-            ResidualBlock(),
-            ResidualBlock(),
-            ResidualBlock(),
-        )
+        ]
+        cnn_layers.extend(ResidualBlock(channels) for _ in range(residual_blocks))
+        self.cnn = nn.Sequential(*cnn_layers)
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
         self.skip_relu = nn.ReLU()
 
-        cnn_height = board_height // 4
-        cnn_width = board_width // 4
-        cnn_flat = 32 * cnn_height * cnn_width
+        cnn_height = self.board_height // 4
+        cnn_width = self.board_width // 4
+        cnn_flat = channels * cnn_height * cnn_width
 
-        # Project the pooled board features to 128 features.
+        # Project pooled board and metadata features before fusion.
         self.cnn_fc = nn.Sequential(
-            nn.Linear(cnn_flat, 128),
+            nn.Linear(cnn_flat, board_embedding_size),
             nn.ReLU(),
         )
 
-        # -- Metadata branch → 64 features --------------------------------
         self.meta_fc = nn.Sequential(
-            nn.Linear(metadata_size, 64),
+            nn.Linear(self.metadata_size, metadata_embedding_size),
             nn.ReLU(),
         )
 
-        # -- Fusion: two linear layers → Q-values -------------------------
         self.head = nn.Sequential(
-            nn.Linear(128 + 64, 128),
+            nn.Linear(board_embedding_size + metadata_embedding_size, fusion_hidden_size),
             nn.ReLU(),
-            nn.Linear(128, output_size),
+            nn.Linear(fusion_hidden_size, output_size),
         )
 
     def forward(self, state):
@@ -108,9 +117,20 @@ class MLP_QNet(nn.Module):
     """Flatten the board and combine it with metadata before an MLP."""
 
     def __init__(self, board_height, board_width, metadata_size, output_size,
-                 hidden_sizes=(128, 128)):
+                 hidden_sizes=(128, 128), state_spec=None):
         super().__init__()
-        sizes = [3 * board_height * board_width + metadata_size, *hidden_sizes]
+        state_spec = state_spec or {
+            'has_board': True, 'board_channels': 3,
+            'board_height': board_height, 'board_width': board_width,
+            'metadata_size': metadata_size,
+        }
+        self.has_board = state_spec['has_board']
+        self.metadata_size = state_spec['metadata_size']
+        board_input_size = (
+            state_spec['board_channels'] * state_spec['board_height'] * state_spec['board_width']
+            if self.has_board else 0
+        )
+        sizes = [board_input_size + self.metadata_size, *hidden_sizes]
         layers = []
         for input_size, hidden_size in zip(sizes, sizes[1:]):
             layers.extend([nn.Linear(input_size, hidden_size), nn.ReLU()])
@@ -118,18 +138,35 @@ class MLP_QNet(nn.Module):
         self.layers = nn.Sequential(*layers)
 
     def forward(self, state):
-        board = state['board_state']
         metadata = state['metadata']
-        if board.dim() == 3:
-            board = board.unsqueeze(0)
         if metadata.dim() == 1:
             metadata = metadata.unsqueeze(0)
-        return self.layers(torch.cat((board.flatten(1), metadata), dim=1))
+        inputs = []
+        if self.has_board:
+            board = state['board_state']
+            if board.dim() == 3:
+                board = board.unsqueeze(0)
+            inputs.append(board.flatten(1))
+        inputs.append(metadata)
+        return self.layers(torch.cat(inputs, dim=1))
 
 
 # Explicit registry: configuration never imports or evaluates arbitrary code.
 ARCHITECTURES = {'residual_cnn': Linear_QNet, 'mlp': MLP_QNet}
-ARCHITECTURE_DEFAULTS = {'residual_cnn': {}, 'mlp': {'hidden_sizes': [128, 128]}}
+ARCHITECTURE_DEFAULTS = {
+    'residual_cnn': {
+        'channels': 32,
+        'residual_blocks': 3,
+        'board_embedding_size': 128,
+        'metadata_embedding_size': 64,
+        'fusion_hidden_size': 128,
+    },
+    'mlp': {'hidden_sizes': [128, 128]},
+}
+ARCHITECTURE_CAPABILITIES = {
+    'residual_cnn': {'requires_board': True},
+    'mlp': {'requires_board': False},
+}
 
 
 def resolve_device(device='auto'):
@@ -199,18 +236,26 @@ class QTrainer:
 
     def _to_state_tensor(self, state):
         if isinstance(state, dict):
-            return {
+            tensors = {
                 'metadata': torch.tensor(np.asarray(state['metadata'], dtype=np.float32),
                                          dtype=torch.float).unsqueeze(0).to(self.device),
-                'board_state': torch.tensor(np.asarray(state['board_state'], dtype=np.float32),
-                                            dtype=torch.float).unsqueeze(0).to(self.device),
             }
-        return {
+            if 'board_state' in state:
+                tensors['board_state'] = torch.tensor(
+                    np.asarray(state['board_state'], dtype=np.float32),
+                    dtype=torch.float,
+                ).unsqueeze(0).to(self.device)
+            return tensors
+        tensors = {
             'metadata': torch.tensor(np.asarray([s['metadata'] for s in state], dtype=np.float32),
                                      dtype=torch.float).to(self.device),
-            'board_state': torch.tensor(np.asarray([s['board_state'] for s in state], dtype=np.float32),
-                                        dtype=torch.float).to(self.device),
         }
+        if 'board_state' in state[0]:
+            tensors['board_state'] = torch.tensor(
+                np.asarray([s['board_state'] for s in state], dtype=np.float32),
+                dtype=torch.float,
+            ).to(self.device)
+        return tensors
 
     def train_step(self, state, action, reward, next_state, done):
         """Standard TD learning: Q(s,a) ← r + γ·max_a' Q(s',a')"""

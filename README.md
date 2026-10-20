@@ -48,27 +48,63 @@ Repeat the same command to resume automatically from `latest.pth`. `Ctrl+C` or a
 
 ### Configure another model
 
-Add another top-level entry to `models.json`. For example, add this preset alongside the existing entries:
+Add another top-level entry to `models.json`. For example, this preset changes the body map, reward schedule, CNN size, and learning settings:
 
 ```json
-"mlp-small": {
-  "architecture": "mlp",
-  "architecture_options": {"hidden_sizes": [64, 64]},
+"binary-board-experiment": {
+  "architecture": "residual_cnn",
+  "state_representation": {
+    "encoder": "board_metadata",
+    "options": {"body_encoding": "binary"}
+  },
+  "rewards": {
+    "step_penalty": -0.02,
+    "progress_reward": 0.1,
+    "progress_penalty": -0.1,
+    "food_reward": 8,
+    "collision_penalty": -12,
+    "timeout_penalty": -4
+  },
+  "architecture_options": {
+    "channels": 48,
+    "residual_blocks": 4,
+    "board_embedding_size": 160,
+    "metadata_embedding_size": 64,
+    "fusion_hidden_size": 128
+  },
   "training": {
     "lr": 0.0005,
     "replay_batch_size": 32,
-    "epsilon_decay": 0.995
+    "replay_warmup": 512,
+    "train_every": 2,
+    "gamma": 0.95,
+    "epsilon_decay": 0.995,
+    "lr_step_size": 400,
+    "lr_decay": 0.9
   }
 }
 ```
 
-Then run `python train.py --model mlp-small --games 1000`. JSON must use double quotes and cannot contain comments or trailing commas. Names may contain letters, digits, underscores, and hyphens, starting with a letter or digit. Unknown settings, duplicate keys, unsupported architectures, and invalid numeric values are rejected before outputs are created.
+Then run `python train.py --model binary-board-experiment --games 1000`. To use the compact metadata-only state, select the MLP and omit the board input:
 
-The `residual_cnn` entry shows all supported training settings and their current defaults. Missing training settings use those defaults; `training: {}` selects them all. `architecture_options` defaults to `{}` for the CNN and `{"hidden_sizes": [128, 128]}` for the MLP. Hidden sizes must be a nonempty array of positive integers. Replay capacity must accommodate both batch size and warmup. Exploration values and gamma must be in `[0, 1]`, decay factors in `(0, 1]`, and `epsilon_min` cannot exceed `epsilon_start`. Other settings must be positive; `min_lr` may also be `null` to disable the learning-rate floor and cannot exceed the initial learning rate.
+```json
+"metadata-only": {
+  "architecture": "mlp",
+  "state_representation": {"encoder": "metadata_only"},
+  "architecture_options": {"hidden_sizes": [64, 32]},
+  "training": {"lr": 0.0005, "gamma": 0.95}
+}
+```
 
-An existing run's resolved configuration must match the selected preset and its checkpoint. If you edit a preset's settings, select a new `--run` name. To keep both experiments easy to select, create a new preset name instead. A new run starts with fresh weights.
+JSON must use double quotes and cannot contain comments or trailing commas. Names may contain letters, digits, underscores, and hyphens, starting with a letter or digit. Unknown settings, duplicate keys, unsupported architectures, and invalid numeric values are rejected before outputs are created. The CNN requires a board-based representation. The board encoder supports `gradient` body values (the default, head to tail from 1 to 0) or `binary` occupancy values (1 for every body segment). `metadata_only` returns only the existing 12 direction, danger, food direction, and food distance features.
 
-To add a different network architecture, implement a `torch.nn.Module` in `model.py` with constructor arguments `board_height`, `board_width`, `metadata_size`, and `output_size`, plus any architecture options. Its `forward(state)` receives `board_state` with shape `(batch, 3, height, width)` and `metadata` with shape `(batch, 12)`, and returns `(batch, 3)` Q-values. Support unbatched state inputs as the existing networks do. Register the class in `ARCHITECTURES`, add its JSON option defaults to `ARCHITECTURE_DEFAULTS`, and validate any new option types/ranges in `configuration.resolve_preset`. JSON selects registered Python classes; it never executes code.
+The `residual_cnn` entry shows all supported training settings and their current defaults. Missing training settings use those defaults; `training: {}` selects them all. CNN architecture options control convolution channels, residual block count, board and metadata embedding sizes, and the fusion layer width. MLP `hidden_sizes` sets its nonempty sequence of positive layer widths. Replay capacity must accommodate both batch size and warmup. Exploration values and gamma must be in `[0, 1]`, decay factors in `(0, 1]`, and `epsilon_min` cannot exceed `epsilon_start`. Other training settings must be positive; `min_lr` may also be `null` to disable the learning-rate floor and cannot exceed the initial learning rate. Reward values accept any finite signed numbers.
+
+An existing run's resolved configuration must match the selected preset and its checkpoint. Older run snapshots that lack `state_representation` or `rewards` are read as using the defaults; the saved files are left as they are until a training checkpoint is naturally saved. If you edit a preset's settings, select a new `--run` name. To keep both experiments easy to select, create a new preset name instead. A new run starts with fresh weights. Raw legacy checkpoints do not record state or reward settings, so they can only be imported for default state and reward behavior.
+
+To add another state representation, implement a deterministic encoder in `state.py` that returns `metadata` and optionally `board_state`, then register its option defaults, allowed options, channel count, and feature size in `STATE_ENCODERS`. Update `resolve_state_representation` to validate its option values and add tests for exact values and shapes. `get_observation_spec` builds the compatible model input contract from that registry, so metadata-only encoders must report zero board channels and return no board tensor.
+
+To add a different network architecture, implement a `torch.nn.Module` in `model.py` with constructor arguments `board_height`, `board_width`, `metadata_size`, and `output_size`, plus `state_spec` and any architecture options. `state_spec` describes whether the selected encoder supplies a board and its dimensions. A board-based `forward(state)` receives `board_state` with shape `(batch, 3, height, width)` and `metadata` with shape `(batch, 12)`; metadata-only models receive just `metadata`. Return `(batch, 3)` Q-values and support unbatched inputs as the existing networks do. Register the class in `ARCHITECTURES`, its capabilities in `ARCHITECTURE_CAPABILITIES`, add JSON option defaults to `ARCHITECTURE_DEFAULTS`, and validate new option types/ranges in `configuration.resolve_preset`. JSON selects registered Python classes; it never executes code.
 
 ### Import the existing model
 
@@ -130,6 +166,8 @@ python plot_training_scores.py --csv training_scores.csv --out training_scores_p
 | `train.py` | Shared command-line entrypoint for named model training and legacy import. |
 | `models.json` | Editable named architecture and training presets. |
 | `configuration.py` | Preset defaults, JSON loading, and validation. |
+| `state.py` | Registered observation encoders and their input-shape descriptions. |
+| `reward_defaults.py` | Default game rewards shared by config validation and the environment. |
 | `agent.py` | Shared training loop, agent state/action logic, replay memory, checkpoints, and legacy entrypoint. |
 | `game.py` | Snake game environment used during training. |
 | `model.py` | Registered CNN and MLP networks, device selection, and DQN trainer. |

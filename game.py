@@ -1,8 +1,10 @@
 import pygame
 import random
+import math
 from enum import Enum
 from collections import namedtuple
 import numpy as np
+from reward_defaults import DEFAULT_REWARDS
 
 pygame.init()
 try:
@@ -28,19 +30,30 @@ BLACK = (0,0,0)
 BLOCK_SIZE = 20
 SPEED = 120
 
-STEP_PENALTY = -0.01
-PROGRESS_REWARD = 0
-PROGRESS_PENALTY = 0
-FOOD_REWARD = 10
-COLLISION_PENALTY = -10
-TIMEOUT_PENALTY = -5
+STEP_PENALTY = DEFAULT_REWARDS['step_penalty']
+PROGRESS_REWARD = DEFAULT_REWARDS['progress_reward']
+PROGRESS_PENALTY = DEFAULT_REWARDS['progress_penalty']
+FOOD_REWARD = DEFAULT_REWARDS['food_reward']
+COLLISION_PENALTY = DEFAULT_REWARDS['collision_penalty']
+TIMEOUT_PENALTY = DEFAULT_REWARDS['timeout_penalty']
 
 class SnakeGameAI:
 
-    def __init__(self, w=640, h=480, render=True):
+    def __init__(self, w=640, h=480, render=True, rewards=None):
         self.w = w
         self.h = h
         self.render = render
+        self.rewards = dict(DEFAULT_REWARDS)
+        if rewards is not None:
+            if not isinstance(rewards, dict):
+                raise ValueError('rewards must be a mapping of reward names to numbers')
+            unknown_rewards = rewards.keys() - DEFAULT_REWARDS.keys()
+            if unknown_rewards:
+                raise ValueError('Unknown rewards: ' + ', '.join(sorted(unknown_rewards)))
+            for name, value in rewards.items():
+                if type(value) not in (int, float) or not math.isfinite(value):
+                    raise ValueError(f'{name} must be a finite number')
+                self.rewards[name] = value
         # init display
         self.display = None
         if self.render:
@@ -75,7 +88,7 @@ class SnakeGameAI:
 
 
     def play_step(self, action):
-        reward = STEP_PENALTY
+        reward = self.rewards['step_penalty']
         self.frame_iteration += 1
         prev_distance = self._manhattan_distance(self.head, self.food)
         # 1. collect user input
@@ -98,7 +111,7 @@ class SnakeGameAI:
         if self.frame_iteration > 100*len(self.snake):
             game_over = True
             self.end_reason = 'timeout'
-            reward += TIMEOUT_PENALTY
+            reward += self.rewards['timeout_penalty']
             return reward, game_over, self.score
         if self.is_collision():
             game_over = True
@@ -106,13 +119,13 @@ class SnakeGameAI:
                 'self-collision' if self.head in self.snake[1:]
                 else 'wall-collision'
             )
-            reward += COLLISION_PENALTY
+            reward += self.rewards['collision_penalty']
             return reward, game_over, self.score
 
         # 4. place new food or just move
         if ate_food:
             self.score += 1
-            reward += FOOD_REWARD
+            reward += self.rewards['food_reward']
             self._place_food()
         else:
             reward += self._distance_delta_reward(prev_distance)
@@ -137,9 +150,9 @@ class SnakeGameAI:
 
         current_distance = self._manhattan_distance(self.head, self.food)
         if current_distance < prev_distance:
-            return PROGRESS_REWARD
+            return self.rewards['progress_reward']
         if current_distance > prev_distance:
-            return PROGRESS_PENALTY
+            return self.rewards['progress_penalty']
 
         return 0
 

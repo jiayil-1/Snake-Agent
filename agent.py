@@ -12,6 +12,7 @@ from game import SnakeGameAI, Direction, Point, BLOCK_SIZE
 from model import ARCHITECTURES, QTrainer, resolve_device
 from configuration import DEFAULT_TRAINING, positive_int, resolve_preset
 from helper import plot
+from state import encode_resolved_state, get_observation_spec
 
 # ── Hyperparameters ──────────────────────────────────────────────────────
 MAX_MEMORY = DEFAULT_TRAINING['max_memory']
@@ -58,10 +59,11 @@ class Agent:
         self.grid_width = self.board_width // BLOCK_SIZE
         self.grid_height = self.board_height // BLOCK_SIZE
 
-        # 3-channel board: head, food, body (all binary 0/1)
-        self.board_channels = 3
-        # Metadata: 4 dir + 3 danger + 4 food_dir + 1 food_dist = 12
-        self.metadata_size = 12
+        self.state_spec = get_observation_spec(
+            self.config['state_representation'], self.grid_height, self.grid_width,
+        )
+        self.board_channels = self.state_spec['board_channels']
+        self.metadata_size = self.state_spec['metadata_size']
 
         self.device = resolve_device(device)
 
@@ -70,6 +72,7 @@ class Agent:
             board_width=self.grid_width,
             metadata_size=self.metadata_size,
             output_size=3,
+            state_spec=self.state_spec,
             **self.config['architecture_options'],
         ).to(self.device)
         self.trainer = QTrainer(
@@ -90,9 +93,24 @@ class Agent:
             return
 
         wrapped = isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint
-        if (self.strict_checkpoint and wrapped and 'config' in checkpoint
-                and checkpoint['config'] != self.config):
-            raise ValueError('Checkpoint configuration differs from this preset; use a new --run name')
+        if self.strict_checkpoint:
+            saved_config = checkpoint.get('config') if wrapped else None
+            if saved_config is not None:
+                try:
+                    saved_config = resolve_preset(saved_config)
+                except ValueError as err:
+                    raise ValueError(f'Checkpoint configuration is invalid: {err}') from err
+                if saved_config != self.config:
+                    raise ValueError(
+                        'Checkpoint configuration differs from this preset; use a new --run name'
+                    )
+            else:
+                default_semantics = resolve_preset({'architecture': self.config['architecture']})
+                if (self.config['state_representation'] != default_semantics['state_representation']
+                        or self.config['rewards'] != default_semantics['rewards']):
+                    raise ValueError(
+                        'Checkpoint has no experiment config; nondefault state or rewards cannot be verified'
+                    )
         model_state = checkpoint['model_state_dict'] if wrapped else checkpoint
         # Strict loading can copy matching tensors before reporting a mismatch.
         # Validate on a copy so rejected checkpoints never alter the live model.
@@ -157,87 +175,19 @@ class Agent:
 
     # ── State representation ─────────────────────────────────────────────
     def get_state(self, game):
-        head = game.snake[0]
-        snake_len = len(game.snake)
-
-        dir_l = game.direction == Direction.LEFT
-        dir_r = game.direction == Direction.RIGHT
-        dir_u = game.direction == Direction.UP
-        dir_d = game.direction == Direction.DOWN
-
-        # Head, food, and head-to-tail body strength, all in [0, 1].
-        board = np.zeros((3, self.grid_height, self.grid_width), dtype=np.float32)
-
-        # Channel 0: head
-        hx = int(head.x // BLOCK_SIZE)
-        hy = int(head.y // BLOCK_SIZE)
-        if 0 <= hx < self.grid_width and 0 <= hy < self.grid_height:
-            board[0, hy, hx] = 1
-
-        # Channel 1: food
-        fx = int(game.food.x // BLOCK_SIZE)
-        fy = int(game.food.y // BLOCK_SIZE)
-        if 0 <= fx < self.grid_width and 0 <= fy < self.grid_height:
-            board[1, fy, fx] = 1
-
-        # Channel 2: body gradient, with the head at 1 and tail at 0.
-        # A one-segment snake has only the head value, 1.
-        denominator = max(1, snake_len - 1)
-        for index, seg in enumerate(game.snake):
-            tx = int(seg.x // BLOCK_SIZE)
-            ty = int(seg.y // BLOCK_SIZE)
-            if 0 <= tx < self.grid_width and 0 <= ty < self.grid_height:
-                board[2, ty, tx] = 1.0 - index / denominator
-
-        # ── Relative direction helpers ───────────────────────────────────
-        clock_wise = [Direction.RIGHT, Direction.DOWN, Direction.LEFT, Direction.UP]
-        idx = clock_wise.index(game.direction)
-        dir_straight = clock_wise[idx]
-        dir_right = clock_wise[(idx + 1) % 4]
-        dir_left = clock_wise[(idx - 1) % 4]
-
-        def _next_point(pt, direction):
-            x, y = pt.x, pt.y
-            if direction == Direction.RIGHT: x += BLOCK_SIZE
-            elif direction == Direction.LEFT: x -= BLOCK_SIZE
-            elif direction == Direction.DOWN: y += BLOCK_SIZE
-            elif direction == Direction.UP: y -= BLOCK_SIZE
-            return Point(x, y)
-
-        # Danger: is there a wall or body one step in each relative direction?
-        danger_straight = game.is_collision(_next_point(head, dir_straight))
-        danger_right = game.is_collision(_next_point(head, dir_right))
-        danger_left = game.is_collision(_next_point(head, dir_left))
-
-        # Normalized Manhattan distance to food
-        max_dist = self.grid_width + self.grid_height
-        food_dist = (abs(head.x - game.food.x) + abs(head.y - game.food.y)) / (BLOCK_SIZE * max_dist)
-
-        # ── Metadata vector (12 features) ────────────────────────────────
-        metadata = np.array([
-            # Current direction (4)
-            int(dir_l), int(dir_r), int(dir_u), int(dir_d),
-            # Danger flags (3)
-            int(danger_straight), int(danger_right), int(danger_left),
-            # Food-relative direction (4)
-            int(game.food.x < head.x),  # food left
-            int(game.food.x > head.x),  # food right
-            int(game.food.y < head.y),  # food up
-            int(game.food.y > head.y),  # food down
-            # Normalized food distance (1)
-            food_dist,
-        ], dtype=np.float32)
-
-        return {
-            'metadata': metadata,
-            'board_state': board,
-        }
+        return encode_resolved_state(
+            self.config['state_representation'], game, self.grid_width, self.grid_height,
+        )
 
     def _state_to_tensor(self, state):
-        return {
+        tensors = {
             'metadata': torch.tensor(state['metadata'], dtype=torch.float).unsqueeze(0).to(self.device),
-            'board_state': torch.tensor(state['board_state'], dtype=torch.float).unsqueeze(0).to(self.device),
         }
+        if 'board_state' in state:
+            tensors['board_state'] = torch.tensor(
+                state['board_state'], dtype=torch.float,
+            ).unsqueeze(0).to(self.device)
+        return tensors
 
     # ── Replay buffer interface ──────────────────────────────────────────
     def remember(self, state, action, reward, next_state, done):
@@ -341,15 +291,21 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
     plot_scores = []
     plot_mean_scores = []
     recent_scores = deque(maxlen=100)
+    resolved_config = resolve_preset(
+        config if config is not None else agent.config if agent is not None
+        else {'architecture': 'residual_cnn'},
+    )
+    if agent is not None and config is not None and resolved_config != agent.config:
+        raise ValueError('Training config differs from the supplied agent config')
     game_number_offset = read_last_game_number(csv_path)
     os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
-    game = SnakeGameAI(render=render)
+    game = SnakeGameAI(render=render, rewards=resolved_config['rewards'])
     if agent is None:
         agent = Agent(
             board_width=game.w,
             board_height=game.h,
             checkpoint_path=checkpoint_path,
-            config=config,
+            config=resolved_config,
             device=device,
             strict_checkpoint=best_checkpoint_path is not None,
         )
