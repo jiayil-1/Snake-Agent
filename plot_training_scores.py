@@ -3,6 +3,9 @@ import csv
 from collections import deque
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
@@ -31,7 +34,7 @@ def calculate_rolling_mean(scores, window_size=100):
 def plot_training_data(games, scores, output_path: Path):
     mean_scores = calculate_rolling_mean(scores)
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(games, scores, label="Score")
+    ax.scatter(games, scores, label="Score", s=6, alpha=0.45, linewidths=0)
     ax.plot(games, mean_scores, label="Mean Score")
 
     ax.set_title("Snake Training Scores")
@@ -42,8 +45,22 @@ def plot_training_data(games, scores, output_path: Path):
     ax.legend()
 
     if games:
-        ax.text(games[-1], scores[-1], f"{scores[-1]:.2f}")
-        ax.text(games[-1], mean_scores[-1], f"{mean_scores[-1]:.2f}")
+        ax.annotate(
+            f"{scores[-1]:.2f}",
+            (games[-1], scores[-1]),
+            xytext=(-5, 8),
+            textcoords="offset points",
+            ha="right",
+            va="bottom",
+        )
+        ax.annotate(
+            f"{mean_scores[-1]:.2f}",
+            (games[-1], mean_scores[-1]),
+            xytext=(-5, -10),
+            textcoords="offset points",
+            ha="right",
+            va="top",
+        )
 
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
