@@ -149,8 +149,8 @@ class Agent:
         dir_u = game.direction == Direction.UP
         dir_d = game.direction == Direction.DOWN
 
-        # ── 3-channel board (all binary 0/1) ──────────────────────────
-        board = np.zeros((3, self.grid_height, self.grid_width), dtype=np.uint8)
+        # Head, food, and head-to-tail body strength, all in [0, 1].
+        board = np.zeros((3, self.grid_height, self.grid_width), dtype=np.float32)
 
         # Channel 0: head
         hx = int(head.x // BLOCK_SIZE)
@@ -164,12 +164,14 @@ class Agent:
         if 0 <= fx < self.grid_width and 0 <= fy < self.grid_height:
             board[1, fy, fx] = 1
 
-        # Channel 2: body (all segments including head)
-        for seg in game.snake:
+        # Channel 2: body gradient, with the head at 1 and tail at 0.
+        # A one-segment snake has only the head value, 1.
+        denominator = max(1, snake_len - 1)
+        for index, seg in enumerate(game.snake):
             tx = int(seg.x // BLOCK_SIZE)
             ty = int(seg.y // BLOCK_SIZE)
             if 0 <= tx < self.grid_width and 0 <= ty < self.grid_height:
-                board[2, ty, tx] = 1
+                board[2, ty, tx] = 1.0 - index / denominator
 
         # ── Relative direction helpers ───────────────────────────────────
         clock_wise = [Direction.RIGHT, Direction.DOWN, Direction.LEFT, Direction.UP]
