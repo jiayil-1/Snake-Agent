@@ -29,7 +29,7 @@ HEAD = (150, 210, 255)
 BLACK = (0,0,0)
 
 BLOCK_SIZE = 20
-SPEED = 120
+SPEED = 30
 
 STEP_PENALTY = DEFAULT_REWARDS['step_penalty']
 PROGRESS_REWARD = DEFAULT_REWARDS['progress_reward']
@@ -262,7 +262,7 @@ class SnakeGameAI:
         pygame.draw.rect(self.display, RED, pygame.Rect(self.food.x, self.food.y, BLOCK_SIZE, BLOCK_SIZE))
 
         text = font.render("Score: " + str(self.score), True, WHITE)
-        self.display.blit(text, [0, 0])
+        self.display.blit(text, [8, 4])
         pygame.display.flip()
 
 
