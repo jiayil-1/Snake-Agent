@@ -8,11 +8,14 @@ import pickle
 import shutil
 import tempfile
 
-from configuration import REPO_ROOT, load_presets, positive_int, resolve_preset, validate_name
+from configuration import (
+    REPO_ROOT, epsilon_ramp_arg, load_presets, positive_int, resolve_preset, start_length_arg,
+    validate_name,
+)
 from model import resolve_device
 
 
-def prepare_run(config, run_dir, device):
+def prepare_run(config, run_dir, device, compile_model=True):
     """Validate existing progress before creating or changing any run files."""
     from agent import Agent, read_last_game_number
 
@@ -34,7 +37,8 @@ def prepare_run(config, run_dir, device):
     elif run_dir.exists() and any(run_dir.iterdir()):
         raise ValueError('Run directory is occupied without config.json; use a new --run name')
 
-    agent = Agent(config=config, checkpoint_path=latest, device=device, strict_checkpoint=True)
+    agent = Agent(config=config, checkpoint_path=latest, device=device, strict_checkpoint=True,
+                  compile_model=compile_model)
     # Validate CSV parsing before training can overwrite a checkpoint.
     read_last_game_number(run_dir / 'training_scores.csv')
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -78,7 +82,15 @@ def main(argv=None):
     parser.add_argument('--games', type=positive_int, help='complete games this invocation (default: unlimited)')
     parser.add_argument('--render', action='store_true', help='show the game window')
     parser.add_argument('--reset-epsilon', action='store_true', help='reset exploration to the preset starting value')
+    parser.add_argument('--start-length', type=start_length_arg,
+                        help='start each game coiled into a solid block of N segments, or of a length drawn '
+                             'from MIN-MAX per game, e.g. 4-30 (default: straight 3)')
+    parser.add_argument('--epsilon-ramp', type=epsilon_ramp_arg, metavar='START-STOP',
+                        help='act greedily (epsilon 0) until a game gains START points, then raise epsilon '
+                             'linearly to its scheduled value at STOP points, e.g. 5-20')
     parser.add_argument('--device', choices=('auto', 'cpu', 'cuda', 'mps'), default='auto')
+    parser.add_argument('--no-compile', action='store_true',
+                        help='train with the eager model instead of torch.compile on CUDA or MPS')
     parser.add_argument('--import-legacy', action='store_true', help='copy legacy checkpoint/history into a run, then exit')
     args = parser.parse_args(argv)
 
@@ -95,19 +107,24 @@ def main(argv=None):
         config = presets[args.model]
         run_dir = REPO_ROOT / 'runs' / run_name
         if args.import_legacy:
-            if args.games is not None or args.render or args.reset_epsilon:
+            if (args.games is not None or args.render or args.reset_epsilon
+                    or args.start_length is not None or args.epsilon_ramp is not None
+                    or args.no_compile):
                 raise ValueError('--import-legacy only imports; run training in a separate invocation')
             import_legacy(config, run_dir, args.device)
             return
 
         from agent import train
+        from game import validate_start_length
 
-        agent = prepare_run(config, run_dir, args.device)
+        validate_start_length(args.start_length)
+        agent = prepare_run(config, run_dir, args.device, compile_model=not args.no_compile)
         print(f'Model: {args.model} | Run: {run_name} | Output: {run_dir}', flush=True)
         train(max_games=args.games, checkpoint_path=run_dir / 'latest.pth',
               best_checkpoint_path=run_dir / 'best.pth',
               csv_path=run_dir / 'training_scores.csv', agent=agent,
-              render=args.render, reset_epsilon=args.reset_epsilon)
+              render=args.render, reset_epsilon=args.reset_epsilon,
+              start_length=args.start_length, epsilon_ramp=args.epsilon_ramp)
     except (OSError, ValueError, RuntimeError, pickle.UnpicklingError, KeyError, TypeError) as err:
         parser.error(str(err))
 

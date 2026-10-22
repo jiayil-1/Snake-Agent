@@ -2,9 +2,11 @@ import contextlib
 import copy
 import io
 import os
+import random
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault('SDL_VIDEODRIVER', 'dummy')
 os.environ.setdefault('SDL_AUDIODRIVER', 'dummy')
@@ -15,7 +17,7 @@ import numpy as np
 from torch import nn
 
 from agent import Agent, save_checkpoint_atomic
-from game import Direction, Point, SnakeGameAI
+from game import BLOCK_SIZE, Direction, Point, SnakeGameAI
 from model import Linear_QNet, QTrainer
 
 
@@ -94,8 +96,8 @@ class ResidualModelTests(unittest.TestCase):
                     self.batches = []
                     self.optimizer_steps = 0
 
-                def train_step(self, states, actions, rewards, next_states, dones):
-                    self.batches.append((tuple(rewards), tuple(dones)))
+                def train_batch(self, states, actions, rewards, next_states, dones):
+                    self.batches.append((rewards.tolist(), dones.tolist()))
                     self.optimizer_steps += 1
 
             agent.trainer = RecordingTrainer()
@@ -117,12 +119,13 @@ class ResidualModelTests(unittest.TestCase):
                 trained = agent.train_long_memory()
                 self.assertEqual(trained, index in (3, 5))
 
-            self.assertEqual([experience[2] for experience in agent.memory], rewards)
+            stored_rewards = agent.memory.sample(len(agent.memory), 'cpu')[2]
+            self.assertEqual(sorted(stored_rewards.tolist()), sorted(rewards))
             self.assertEqual(len(agent.trainer.batches), 2)
             for batch_rewards, batch_dones in agent.trainer.batches:
                 self.assertEqual(len(batch_rewards), 2)
                 self.assertTrue(set(batch_rewards).issubset(set(rewards)))
-                self.assertTrue(all(isinstance(done, bool) for done in batch_dones))
+                self.assertTrue(set(batch_dones).issubset({0.0, 1.0}))
             self.assertEqual(agent.trainer.optimizer_steps, 2)
             self.assertEqual(agent.environment_steps, 6)
 
@@ -131,7 +134,7 @@ class ResidualModelTests(unittest.TestCase):
             [[1.0, 2.0, 3.0], [-1.0, 4.0, 0.5], [7.0, 8.0, 9.0]],
             requires_grad=True,
         )
-        actions = torch.tensor([[0, 1, 0], [0, 0, 1], [1, 0, 0]])
+        actions = torch.tensor([1, 2, 0])
         rewards = torch.tensor([0.5, -2.0, 3.0])
         next_q_values = torch.tensor(
             [[2.0, 4.0, 1.0], [8.0, 3.0, 4.0], [-2.0, 1.0, 0.0]],
@@ -144,7 +147,7 @@ class ResidualModelTests(unittest.TestCase):
         expected = predictions.detach().clone()
         for row in range(len(dones)):
             next_value = 0.0 if dones[row] else 0.9 * next_q_values[row].max()
-            expected[row, actions[row].argmax()] = rewards[row] + next_value
+            expected[row, actions[row]] = rewards[row] + next_value
 
         torch.testing.assert_close(observed, expected)
         self.assertFalse(observed.requires_grad)
@@ -280,6 +283,165 @@ class ResidualModelTests(unittest.TestCase):
                     self.assertEqual(len(agent.trainer.optimizer.state), 0)
 
 
+class BatchedActionTests(unittest.TestCase):
+    def make_agent(self, directory, epsilon):
+        return Agent(
+            config={'architecture': 'mlp', 'training': {
+                'epsilon_start': epsilon, 'epsilon_min': epsilon,
+            }},
+            device='cpu', checkpoint_path=Path(directory) / 'missing.pth',
+        )
+
+    def count_forward_passes(self, agent):
+        calls = []
+        handle = agent.model.register_forward_hook(lambda *_: calls.append(1))
+        self.addCleanup(handle.remove)
+        return calls
+
+    def test_greedy_actions_share_one_forward_pass_and_match_single_states(self):
+        rng = np.random.default_rng(0)
+        states = [{'board_state': rng.random((3, 24, 32), dtype=np.float32),
+                   'metadata': rng.random(12, dtype=np.float32)} for _ in range(5)]
+        with tempfile.TemporaryDirectory() as directory:
+            agent = self.make_agent(directory, 0.0)
+            calls = self.count_forward_passes(agent)
+            moves = agent.get_actions(states)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(moves, [agent.get_action(state) for state in states])
+            self.assertEqual(len(calls), 1 + len(states))
+
+    def test_random_actions_skip_the_model(self):
+        states = [{'board_state': np.zeros((3, 24, 32), dtype=np.float32),
+                   'metadata': np.zeros(12, dtype=np.float32)}] * 4
+        with tempfile.TemporaryDirectory() as directory:
+            agent = self.make_agent(directory, 1.0)
+            calls = self.count_forward_passes(agent)
+            moves = agent.get_actions(states)
+            self.assertEqual(calls, [])
+            self.assertTrue(all(sorted(move) == [0, 0, 1] for move in moves))
+
+    def test_epsilon_scales_make_zero_scaled_rows_greedy(self):
+        states = [{'board_state': np.zeros((3, 24, 32), dtype=np.float32),
+                   'metadata': np.zeros(12, dtype=np.float32)}] * 3
+        with tempfile.TemporaryDirectory() as directory:
+            agent = self.make_agent(directory, 1.0)
+            batch_sizes = []
+            handle = agent.model.register_forward_hook(
+                lambda _module, inputs, _output: batch_sizes.append(inputs[0]['metadata'].shape[0]))
+            self.addCleanup(handle.remove)
+            agent.get_actions(states, [0.0, 1.0, 0.0])
+            self.assertEqual(batch_sizes, [2])
+
+
+class EpsilonRampTests(unittest.TestCase):
+    def test_scale_is_zero_until_start_then_linear_to_one_at_stop(self):
+        from agent import epsilon_ramp_scale
+        self.assertEqual([epsilon_ramp_scale(points, (2, 6)) for points in range(9)],
+                         [0, 0, 0, 0.25, 0.5, 0.75, 1, 1, 1])
+
+    def test_training_ramps_each_game_from_its_starting_score(self):
+        import agent as agent_module
+
+        class ScoringGame(SnakeGameAI):
+            """Scores a point every step and ends after five steps."""
+            def play_step(self, action):
+                self.score += 1
+                self.end_reason = 'test'
+                return 0.0, self.score - self.start_score == 5, self.score
+
+        scales = []
+        with tempfile.TemporaryDirectory() as directory:
+            agent = Agent(config={'architecture': 'mlp', 'training': {'parallel_games': 1}},
+                          device='cpu', checkpoint_path=Path(directory) / 'missing.pth')
+            original = agent.get_actions
+            agent.get_actions = lambda states, epsilon_scales=None: (
+                scales.append(epsilon_scales) or original(states, epsilon_scales))
+            with patch.object(agent_module, 'SnakeGameAI', ScoringGame), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                agent_module.train(max_games=1, agent=agent, start_length=10,
+                                   checkpoint_path=Path(directory) / 'latest.pth',
+                                   csv_path=Path(directory) / 'scores.csv',
+                                   epsilon_ramp=(1, 3))
+        self.assertEqual(scales, [[0.0], [0.0], [0.5], [1.0], [1.0]])
+
+    def test_invalid_ramps_are_rejected(self):
+        import argparse
+        from configuration import epsilon_ramp_arg, validate_epsilon_ramp
+        self.assertEqual(epsilon_ramp_arg('0-20'), (0, 20))
+        for value in ('5', '5-5', '6-5', '-1-3', 'a-b', '3-'):
+            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
+                epsilon_ramp_arg(value)
+        for value in ((5, 5), (1.0, 2), [1, 2], (1, 2, 3)):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'epsilon_ramp'):
+                validate_epsilon_ramp(value)
+
+
+class ReplayMemoryTests(unittest.TestCase):
+    def test_ring_buffer_replaces_oldest_and_samples_aligned_rows(self):
+        from agent import ReplayMemory
+        from state import StateLayout
+
+        spec = {'has_board': True, 'board_channels': 3, 'board_height': 2,
+                'board_width': 2, 'metadata_size': 12}
+
+        def state(value):
+            return {'metadata': np.full(12, value, dtype=np.float32),
+                    'board_state': np.arange(12, dtype=np.float32).reshape(3, 2, 2) + value}
+
+        memory = ReplayMemory(3, StateLayout(spec))
+        for index in range(5):
+            memory.append(state(index), index % 3, index / 4, state(index + 10), index == 4)
+        self.assertEqual(len(memory), 3)
+
+        states, actions, rewards, next_states, dones = memory.sample(3, 'cpu')
+        order = torch.argsort(rewards)
+        torch.testing.assert_close(rewards[order], torch.tensor([0.5, 0.75, 1.0]))
+        self.assertEqual(actions[order].tolist(), [2, 0, 1])
+        self.assertEqual(dones[order].tolist(), [0.0, 0.0, 1.0])
+        for row, value in enumerate([2, 3, 4]):
+            for batch, offset in ((states, 0), (next_states, 10)):
+                expected = state(value + offset)
+                for key in ('metadata', 'board_state'):
+                    np.testing.assert_array_equal(batch[key][order][row].numpy(), expected[key])
+
+        compact = StateLayout({**spec, 'has_board': False, 'board_channels': 0})
+        self.assertEqual([field[0] for field in compact.fields], ['metadata'])
+        self.assertEqual(compact.size, 12)
+
+
+class FusedOptimizerTests(unittest.TestCase):
+    def test_unfused_optimizer_checkpoint_resumes_fused(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.chdir(directory):
+            agent = Agent(replay_batch_size=2, replay_warmup=2, train_every=1)
+            game = SnakeGameAI(render=False)
+            for _ in range(3):
+                state = agent.get_state(game)
+                reward, done, _ = game.play_step([1, 0, 0])
+                agent.remember(state, [1, 0, 0], reward, agent.get_state(game), done)
+                agent.train_long_memory()
+                if done:
+                    game.reset()
+            save_checkpoint_atomic(agent)
+            checkpoint = torch.load('model/model.pth', weights_only=True)
+            optimizer_state = checkpoint['optimizer_state_dict']
+            for group in optimizer_state['param_groups']:
+                group['fused'] = None
+            for state in optimizer_state['state'].values():
+                state['step'] = state['step'].cpu()
+            torch.save(checkpoint, 'unfused.pth')
+
+            restored = Agent(replay_batch_size=2, replay_warmup=2, train_every=1,
+                             checkpoint_path='unfused.pth')
+            optimizer = restored.trainer.optimizer
+            self.assertTrue(all(group['fused'] for group in optimizer.param_groups))
+            for parameter, state in optimizer.state.items():
+                self.assertEqual(state['step'].device, parameter.device)
+                self.assertEqual(state['step'].item(), 2)
+            observation = restored.get_state(game)
+            restored.trainer.train_step(observation, [0, 1, 0], 1.0, observation, False)
+            self.assertTrue(all(state['step'].item() == 3 for state in optimizer.state.values()))
+
+
 class RewardConfigurationTests(unittest.TestCase):
     def setUp(self):
         self.rewards = {
@@ -349,6 +511,75 @@ class RewardConfigurationTests(unittest.TestCase):
                       if Point(x, y) != free]
         self.assertTrue(game._place_food())
         self.assertEqual(game.food, free)
+
+
+class StartLengthTests(unittest.TestCase):
+    def test_random_start_is_a_solid_block_with_the_head_outside_and_a_safe_first_move(self):
+        random.seed(3)
+        layouts = set()
+        facing = {
+            (BLOCK_SIZE, 0): Direction.RIGHT, (-BLOCK_SIZE, 0): Direction.LEFT,
+            (0, BLOCK_SIZE): Direction.DOWN, (0, -BLOCK_SIZE): Direction.UP,
+        }
+        for length in (1, 2, 3, 25, 192):
+            game = SnakeGameAI(render=False, start_length=length)
+            for _ in range(20):
+                game.reset()
+                snake = game.snake
+                self.assertEqual(len(snake), length)
+                self.assertEqual(game.score, length - 3)
+                self.assertEqual(len(set(snake)), length)
+                self.assertIs(game.head, snake[0])
+                self.assertNotIn(game.food, snake)
+                for a, b in zip(snake, snake[1:]):
+                    self.assertEqual(abs(a.x - b.x) + abs(a.y - b.y), BLOCK_SIZE)
+                for pt in snake:
+                    self.assertTrue(0 <= pt.x < game.w and 0 <= pt.y < game.h)
+                    self.assertEqual((pt.x % BLOCK_SIZE, pt.y % BLOCK_SIZE), (0, 0))
+                if length > 1:
+                    # The head never faces back into its neck.
+                    neck = (snake[1].x - snake[0].x, snake[1].y - snake[0].y)
+                    self.assertNotEqual(game.direction, facing[neck])
+                # Flood the padded bounding box from its corner: every free cell
+                # must be reached (no holes), and so must the cell ahead of the head.
+                cells = {(pt.x // BLOCK_SIZE, pt.y // BLOCK_SIZE) for pt in snake}
+                xs, ys = [x for x, _ in cells], [y for _, y in cells]
+                box = {(x, y) for x in range(min(xs) - 1, max(xs) + 2)
+                       for y in range(min(ys) - 1, max(ys) + 2)}
+                outside, frontier = set(), [(min(xs) - 1, min(ys) - 1)]
+                while frontier:
+                    x, y = frontier.pop()
+                    if (x, y) in box and (x, y) not in cells and (x, y) not in outside:
+                        outside.add((x, y))
+                        frontier += [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]
+                self.assertEqual(outside, box - cells)
+                dx, dy = {v: k for k, v in facing.items()}[game.direction]
+                ahead = ((game.head.x + dx) // BLOCK_SIZE, (game.head.y + dy) // BLOCK_SIZE)
+                self.assertIn(ahead, outside)
+                if length == 25:
+                    layouts.add(tuple(snake))
+                _, done, _ = game.play_step([1, 0, 0])
+                self.assertFalse(done)
+        self.assertGreater(len(layouts), 15)
+
+    def test_range_start_draws_each_length_inclusively(self):
+        random.seed(5)
+        game = SnakeGameAI(render=False, start_length=(4, 7))
+        lengths = set()
+        for _ in range(60):
+            game.reset()
+            lengths.add(len(game.snake))
+            self.assertEqual(game.score, len(game.snake) - 3)
+        self.assertEqual(lengths, {4, 5, 6, 7})
+
+    def test_default_start_is_unchanged_and_invalid_lengths_fail(self):
+        game = SnakeGameAI(render=False)
+        self.assertEqual(game.snake, [Point(320, 240), Point(300, 240), Point(280, 240)])
+        self.assertEqual(game.direction, Direction.RIGHT)
+        self.assertEqual(game.score, 0)
+        for length in (0, -1, 385, 3.0, True, (5,), (5, 4), (0, 4), (4, 385), (4, 5, 6), (4.0, 5)):
+            with self.subTest(length=length), self.assertRaisesRegex(ValueError, 'start_length'):
+                SnakeGameAI(render=False, start_length=length)
 
 
 if __name__ == '__main__':

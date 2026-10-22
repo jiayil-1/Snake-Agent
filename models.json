@@ -28,6 +28,7 @@
       "replay_batch_size": 64,
       "replay_warmup": 1000,
       "train_every": 4,
+      "parallel_games": 128,
       "lr": 0.0001,
       "gamma": 0.99,
       "epsilon_start": 1.0,

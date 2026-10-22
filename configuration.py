@@ -18,6 +18,7 @@ DEFAULT_TRAINING = {
     'replay_batch_size': 64,
     'replay_warmup': 1000,
     'train_every': 4,
+    'parallel_games': 128,
     'lr': 0.001,
     'gamma': 0.99,
     'epsilon_start': 1.0,
@@ -44,6 +45,44 @@ def positive_int(value):
     if parsed < 1:
         raise argparse.ArgumentTypeError('must be a positive integer')
     return parsed
+
+
+def start_length_arg(value):
+    """Parse ``N`` as a fixed start length or ``MIN-MAX`` as an inclusive range."""
+    low, separator, high = value.partition('-')
+    if not separator:
+        return positive_int(value)
+    try:
+        bounds = positive_int(low), positive_int(high)
+    except argparse.ArgumentTypeError as err:
+        raise argparse.ArgumentTypeError('must be N or MIN-MAX with positive integers') from err
+    if bounds[0] > bounds[1]:
+        raise argparse.ArgumentTypeError('range minimum cannot exceed its maximum')
+    return bounds
+
+
+def validate_epsilon_ramp(epsilon_ramp):
+    """Accept ``None`` or a ``(start, stop)`` pair of points gained with 0 <= start < stop."""
+    if epsilon_ramp is None:
+        return None
+    if (not isinstance(epsilon_ramp, tuple) or len(epsilon_ramp) != 2
+            or any(type(n) is not int for n in epsilon_ramp)
+            or not 0 <= epsilon_ramp[0] < epsilon_ramp[1]):
+        raise ValueError(f'epsilon_ramp must be a (start, stop) pair of integers with '
+                         f'0 <= start < stop, got {epsilon_ramp!r}')
+    return epsilon_ramp
+
+
+def epsilon_ramp_arg(value):
+    """Parse ``START-STOP`` as the points gained where exploration ramps up."""
+    low, separator, high = value.partition('-')
+    try:
+        if not separator:
+            raise ValueError
+        return validate_epsilon_ramp((int(low), int(high)))
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            'must be START-STOP with integers 0 <= START < STOP') from None
 
 
 def _object(value, label, allowed):

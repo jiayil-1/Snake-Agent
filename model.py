@@ -195,6 +195,7 @@ class QTrainer:
         lr_decay=0.95,
         min_lr=1e-5,
         device='auto',
+        compile_model=True,
     ):
         self.lr = lr
         self.gamma = gamma
@@ -203,7 +204,9 @@ class QTrainer:
         print(f'Using {self.device} to train')
         self.model = model.to(self.device)
         self.max_grad_norm = max_grad_norm
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+        # One fused kernel replaces several launches per parameter tensor.
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr, fused=True)
+        self.optimizer.register_load_state_dict_post_hook(self._keep_fused_adam)
         self.scheduler = optim.lr_scheduler.StepLR(
             self.optimizer,
             # Replay updates happen every four environment moves by default.
@@ -213,62 +216,39 @@ class QTrainer:
         )
         self.criterion = nn.MSELoss()
         self.optimizer_steps = 0
+        # Compiling the loss fuses the forward and backward kernels, which is
+        # most of each update on CUDA and MPS. On CPU it measured no faster and
+        # adds seconds of warmup. Shapes are static: replay batches never vary.
+        self._loss = (torch.compile(self._td_loss, dynamic=False)
+                      if compile_model and self.device.type != 'cpu' else self._td_loss)
 
     def current_lr(self):
         return self.optimizer.param_groups[0]['lr']
 
     @staticmethod
+    def _keep_fused_adam(optimizer):
+        # Loading replaces the live param-group flags with the saved ones, so
+        # checkpoints from the unfused optimizer would otherwise disable fusion.
+        for group in optimizer.param_groups:
+            group['fused'] = True
+            group['foreach'] = None
+            for parameter in group['params']:
+                state = optimizer.state.get(parameter, {})
+                if 'step' in state:
+                    state['step'] = state['step'].to(device=parameter.device, dtype=torch.float32)
+
+    @staticmethod
     def build_td_target(predictions, actions, rewards, next_q_values, dones, gamma):
-        """Build DQN targets while changing only the action selected per row."""
-        action_indices = torch.argmax(actions, dim=1)
-        done_mask = torch.as_tensor(
-            dones,
-            dtype=predictions.dtype,
-            device=predictions.device,
-        )
+        """Build DQN targets while changing only the action index selected per row."""
+        done_mask = dones.to(predictions.dtype)
         max_next_q = torch.max(next_q_values, dim=1).values
         target_q = rewards + (1.0 - done_mask) * gamma * max_next_q
 
         target = predictions.detach().clone()
-        row_indices = torch.arange(target.shape[0], device=target.device)
-        target[row_indices, action_indices] = target_q
+        target.scatter_(1, actions.unsqueeze(1), target_q.unsqueeze(1))
         return target
 
-    def _to_state_tensor(self, state):
-        if isinstance(state, dict):
-            tensors = {
-                'metadata': torch.tensor(np.asarray(state['metadata'], dtype=np.float32),
-                                         dtype=torch.float).unsqueeze(0).to(self.device),
-            }
-            if 'board_state' in state:
-                tensors['board_state'] = torch.tensor(
-                    np.asarray(state['board_state'], dtype=np.float32),
-                    dtype=torch.float,
-                ).unsqueeze(0).to(self.device)
-            return tensors
-        tensors = {
-            'metadata': torch.tensor(np.asarray([s['metadata'] for s in state], dtype=np.float32),
-                                     dtype=torch.float).to(self.device),
-        }
-        if 'board_state' in state[0]:
-            tensors['board_state'] = torch.tensor(
-                np.asarray([s['board_state'] for s in state], dtype=np.float32),
-                dtype=torch.float,
-            ).to(self.device)
-        return tensors
-
-    def train_step(self, state, action, reward, next_state, done):
-        """Standard TD learning: Q(s,a) ← r + γ·max_a' Q(s',a')"""
-        state = self._to_state_tensor(state)
-        next_state = self._to_state_tensor(next_state)
-        action = torch.tensor(np.asarray(action), dtype=torch.long).to(self.device)
-        reward = torch.tensor(np.asarray(reward), dtype=torch.float).to(self.device)
-
-        if action.dim() == 1:
-            action = action.unsqueeze(0)
-            reward = reward.unsqueeze(0)
-            done = (done,)
-
+    def _td_loss(self, state, action, reward, next_state, done):
         # Current Q-values
         pred = self.model(state)
 
@@ -278,9 +258,33 @@ class QTrainer:
             target = self.build_td_target(
                 pred, action, reward, next_q, done, self.gamma,
             )
+        return self.criterion(pred, target)
 
+    def _to_device(self, values, dtype=np.float32):
+        return torch.from_numpy(np.asarray(values, dtype=dtype)).to(self.device)
+
+    def train_step(self, state, action, reward, next_state, done):
+        """Train one transition or a sequence of transitions with one-hot actions."""
+        if isinstance(state, dict):
+            state, action, reward, next_state, done = (
+                [state], [action], [reward], [next_state], [done],
+            )
+
+        def stack(states):
+            return {key: self._to_device(np.stack([s[key] for s in states])) for key in states[0]}
+
+        self.train_batch(
+            stack(state), self._to_device(np.argmax(np.asarray(action), axis=1), np.int64),
+            self._to_device(reward), stack(next_state), self._to_device(done),
+        )
+
+    def train_batch(self, state, action, reward, next_state, done):
+        """Standard TD learning: Q(s,a) ← r + γ·max_a' Q(s',a')
+
+        Inputs are batched tensors on the training device; actions are indices.
+        """
         self.optimizer.zero_grad()
-        loss = self.criterion(pred, target)
+        loss = self._loss(state, action, reward, next_state, done)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
         self.optimizer.step()

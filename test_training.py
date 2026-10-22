@@ -1,5 +1,7 @@
+import contextlib
 import copy
 import csv
+import io
 import json
 import os
 from pathlib import Path
@@ -186,6 +188,43 @@ class ArchitectureTests(unittest.TestCase):
         })
         self.assertEqual(output.shape, (2, 3))
 
+    @unittest.skipUnless(torch.cuda.is_available() or torch.backends.mps.is_available(),
+                         'torch.compile is only used on CUDA or MPS')
+    def test_compiled_loss_matches_eager_updates(self):
+        device = 'cuda' if torch.cuda.is_available() else 'mps'
+        config = resolve_preset({'architecture': 'residual_cnn'})
+        spec = get_observation_spec(config['state_representation'], 24, 32)
+        eager_model = ARCHITECTURES['residual_cnn'](
+            24, 32, 12, 3, state_spec=spec, **config['architecture_options'],
+        )
+        compiled_model = copy.deepcopy(eager_model)
+        eager = QTrainer(eager_model, lr=0.001, gamma=0.99, device=device, compile_model=False)
+        compiled = QTrainer(compiled_model, lr=0.001, gamma=0.99, device=device)
+        self.assertNotEqual(compiled._loss, compiled._td_loss)
+        generator = torch.Generator().manual_seed(0)
+        for _ in range(3):
+            batch = (
+                {'board_state': torch.rand(8, 3, 24, 32, generator=generator),
+                 'metadata': torch.rand(8, 12, generator=generator)},
+                torch.randint(0, 3, (8,), generator=generator),
+                torch.rand(8, generator=generator),
+                {'board_state': torch.rand(8, 3, 24, 32, generator=generator),
+                 'metadata': torch.rand(8, 12, generator=generator)},
+                (torch.rand(8, generator=generator) < 0.25).float(),
+            )
+            on_device = [{key: value.to(device) for key, value in part.items()}
+                         if isinstance(part, dict) else part.to(device) for part in batch]
+            eager.train_batch(*on_device)
+            compiled.train_batch(*on_device)
+        for (name, expected), actual in zip(eager_model.state_dict().items(),
+                                            compiled_model.state_dict().values()):
+            torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5, msg=name)
+
+    def test_cpu_trainer_stays_eager(self):
+        model = ARCHITECTURES['mlp'](24, 32, 12, 3, hidden_sizes=[8])
+        trainer = QTrainer(model, lr=0.001, gamma=0.99, device='cpu')
+        self.assertEqual(trainer._loss, trainer._td_loss)
+
 
 class ConfiguredAgentTests(unittest.TestCase):
     def test_configuration_controls_training_and_round_trips(self):
@@ -204,7 +243,7 @@ class ConfiguredAgentTests(unittest.TestCase):
             path = Path(directory) / 'latest.pth'
             agent = Agent(config=config, device='cpu', checkpoint_path=path,
                           strict_checkpoint=True)
-            self.assertEqual(agent.memory.maxlen, 10)
+            self.assertEqual(agent.memory.capacity, 10)
             self.assertEqual(agent.trainer.gamma, 0.8)
             game = SnakeGameAI(render=False)
             for _ in range(4):
@@ -289,6 +328,76 @@ class CheckpointPolicyTests(unittest.TestCase):
             self.assertEqual(checkpoint['metadata']['best_reward'], 100)
             self.assertEqual([row.split(',')[0] for row in csv.read_text().splitlines()[1:]], ['1', '2'])
 
+    def test_live_mean_continues_from_logged_history(self):
+        from agent import Agent, read_recent_scores, train
+        from game import SnakeGameAI
+
+        class ScoreTenGame(SnakeGameAI):
+            def play_step(self, action):
+                self.end_reason = 'timeout'
+                return 1.0, True, 10
+
+        config = resolve_preset({'architecture': 'mlp', 'training': {'parallel_games': 1}})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            latest, best, csv_path = root / 'latest.pth', root / 'best.pth', root / 'scores.csv'
+            self.assertEqual(read_recent_scores(csv_path, 100), [])
+            # 150 logged games: the last 100 scores are 50..149.
+            csv_path.write_text('game,score,end_reason\n' + ''.join(
+                f'{n + 1},{n},timeout\n' for n in range(150)))
+            self.assertEqual(read_recent_scores(csv_path, 100), [float(n) for n in range(50, 150)])
+            agent = Agent(config=config, device='cpu', checkpoint_path=latest, strict_checkpoint=True)
+            with (patch('agent.SnakeGameAI', ScoreTenGame), patch('agent.HIDE_PLOT', False),
+                  patch('agent.plot') as plot):
+                train(max_games=1, agent=agent, checkpoint_path=latest,
+                      best_checkpoint_path=best, csv_path=csv_path)
+            _, means = plot.call_args.args
+            self.assertEqual(means, [(sum(range(51, 150)) + 10) / 100])
+
+    def test_parallel_slots_restart_until_the_run_limit(self):
+        from agent import Agent, train
+        from game import SnakeGameAI
+
+        config = resolve_preset({'architecture': 'mlp', 'training': {
+            'parallel_games': 3, 'replay_batch_size': 2, 'replay_warmup': 2,
+            'train_every': 2, 'max_memory': 32,
+        }})
+        # Games end after these step counts, in the order they start. A sixth
+        # start would exhaust the iterator and fail the run.
+        lengths = iter([3, 1, 2, 4, 1])
+
+        class CountdownGame(SnakeGameAI):
+            def reset(self):
+                super().reset()
+                self.length = self.remaining = next(lengths)
+
+            def play_step(self, action):
+                self.remaining -= 1
+                self.end_reason = 'timeout'
+                return 1.0, self.remaining == 0, self.length
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            latest, best, csv_path = root / 'latest.pth', root / 'best.pth', root / 'scores.csv'
+            agent = Agent(config=config, device='cpu', checkpoint_path=latest, strict_checkpoint=True)
+            with patch('agent.SnakeGameAI', CountdownGame):
+                train(max_games=5, agent=agent, checkpoint_path=latest,
+                      best_checkpoint_path=best, csv_path=csv_path)
+            self.assertIsNone(next(lengths, None))
+            with csv_path.open() as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual([int(row['game']) for row in rows], [1, 2, 3, 4, 5])
+            # Scores are game lengths, logged in completion order across slots.
+            self.assertEqual([int(row['score']) for row in rows], [1, 2, 3, 1, 4])
+            self.assertEqual({row['start_score'] for row in rows}, {'0'})
+            checkpoint = torch.load(latest, weights_only=True)
+            self.assertEqual(checkpoint['metadata']['n_games'], 5)
+            self.assertEqual(checkpoint['metadata']['best_reward'], 4.0)
+            self.assertEqual(checkpoint['training_state']['environment_steps'], 11)
+            # Warmup is met at step 2; updates follow at every second step after it.
+            self.assertEqual(checkpoint['training_state']['optimizer_steps'], 5)
+            self.assertEqual(torch.load(best, weights_only=True)['metadata']['best_reward'], 4.0)
+
     def test_mid_episode_interrupt_saves_latest_without_logging(self):
         from agent import Agent, train
         from game import SnakeGameAI
@@ -309,6 +418,35 @@ class CheckpointPolicyTests(unittest.TestCase):
             self.assertFalse(best.exists())
 
 
+class ScoreLogTests(unittest.TestCase):
+    def test_older_logs_gain_blank_columns_and_plot_gained_scores(self):
+        from helper import append_score, ensure_score_columns
+        import plot_training_scores
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            oldest, older = root / 'oldest.csv', root / 'older.csv'
+            oldest.write_text('game,score\n1,2\n')
+            older.write_text('game,score,end_reason\n1,2,timeout\n')
+            for path in (oldest, older):
+                ensure_score_columns(path)
+                append_score(path, 2, 30, 'self-collision', 25)
+            self.assertEqual(oldest.read_text().splitlines(),
+                             ['game,score,end_reason,start_score', '1,2,,', '2,30,self-collision,25'])
+            self.assertEqual(older.read_text().splitlines(),
+                             ['game,score,end_reason,start_score', '1,2,timeout,', '2,30,self-collision,25'])
+
+            games, scores, starts = plot_training_scores.load_training_data(older)
+            self.assertEqual((games, scores, starts), ([1, 2], [2.0, 30.0], [None, 25.0]))
+            out = root / 'plot.png'
+            with patch.object(plot_training_scores, 'plot_series',
+                              wraps=plot_training_scores.plot_series) as plot_series:
+                plot_training_scores.plot_training_data(games, scores, starts, out)
+            # Only the game with a logged start contributes to the gained panel.
+            self.assertEqual(plot_series.call_args_list[1].args[1:], ((2,), (5.0,), 'Score Gained'))
+            self.assertTrue(out.exists())
+
+
 class TrainingCliTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -322,7 +460,7 @@ class TrainingCliTests(unittest.TestCase):
         self.presets = {
             name: {'architecture': name, 'training': {
                 'replay_batch_size': 2, 'replay_warmup': 2,
-                'train_every': 1, 'max_memory': 32,
+                'train_every': 1, 'max_memory': 32, 'parallel_games': 2,
             }} for name in ('residual_cnn', 'mlp')
         }
         self.write_presets()
@@ -362,7 +500,14 @@ train.main({import_args})
         self.assertIn('residual_cnn', result.stdout)
         self.assertIn('mlp', result.stdout)
         self.assertNotIn('pygame-ce', result.stdout)
-        for args in [(), ('--model', 'unknown'), ('--model', 'mlp', '--run', '../outside')]:
+        for args in [(), ('--model', 'unknown'), ('--model', 'mlp', '--run', '../outside'),
+                     ('--model', 'mlp', '--start-length', '0'),
+                     ('--model', 'mlp', '--start-length', '385'),
+                     ('--model', 'mlp', '--start-length', '30-4'),
+                     ('--model', 'mlp', '--start-length', '4-385'),
+                     ('--model', 'mlp', '--start-length', '4-'),
+                     ('--model', 'mlp', '--epsilon-ramp', '5'),
+                     ('--model', 'mlp', '--epsilon-ramp', '5-5')]:
             self.cli(*args, success=False)
         self.presets['mlp']['training']['typo'] = 1
         self.write_presets()
@@ -428,7 +573,10 @@ train.main({import_args})
         self.assertEqual(config['rewards']['step_penalty'], -0.02)
         self.assertEqual(checkpoint['model_state_dict']['layers.0.weight'].shape, (16, 12))
 
-        self.one_step_cli('--model', 'metadata-exp', '--games', '1', '--device', 'cpu')
+        # --epsilon-ramp is per invocation, so it leaves the run configuration unchanged.
+        self.one_step_cli('--model', 'metadata-exp', '--games', '1', '--device', 'cpu',
+                          '--epsilon-ramp', '0-5')
+        self.assertEqual(json.loads((run / 'config.json').read_text()), config)
         resumed = torch.load(run / 'latest.pth', weights_only=True)
         self.assertEqual(resumed['metadata']['n_games'], 2)
         before = {path.name: path.read_bytes() for path in run.iterdir()}
@@ -523,7 +671,8 @@ train.main(['--model', 'mlp', '--run', 'interrupted', '--device', 'cpu'])
         run = self.root / 'runs' / 'interrupted'
         checkpoint = torch.load(run / 'latest.pth', weights_only=True)
         self.assertEqual(checkpoint['metadata']['n_games'], 0)
-        self.assertEqual(checkpoint['training_state']['environment_steps'], 1)
+        # The signal lands in the first game; the second still finishes its step.
+        self.assertEqual(checkpoint['training_state']['environment_steps'], 2)
         self.assertFalse((run / 'training_scores.csv').exists())
         self.assertFalse((run / 'best.pth').exists())
 

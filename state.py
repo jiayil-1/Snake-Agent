@@ -1,6 +1,7 @@
 """Registered, data-only observation encoders for Snake agents."""
 
 from copy import deepcopy
+import math
 
 import numpy as np
 
@@ -139,6 +140,39 @@ def get_observation_spec(representation, board_height, board_width):
         'board_width': board_width if has_board else 0,
         'metadata_size': encoder['metadata_size'],
     }
+
+
+class StateLayout:
+    """Pack encoded observations into flat float32 vectors and restore model inputs.
+
+    A flat layout lets one host-to-device copy carry every input of a state.
+    """
+
+    def __init__(self, state_spec):
+        shapes = {}
+        if state_spec['has_board']:
+            shapes['board_state'] = (state_spec['board_channels'],
+                                     state_spec['board_height'], state_spec['board_width'])
+        shapes['metadata'] = (state_spec['metadata_size'],)
+        self.fields = []
+        self.size = 0
+        for key, shape in shapes.items():
+            stop = self.size + math.prod(shape)
+            self.fields.append((key, self.size, stop, shape))
+            self.size = stop
+
+    def pack(self, state, out=None):
+        if out is None:
+            out = np.empty(self.size, dtype=np.float32)
+        for key, start, stop, _ in self.fields:
+            out[start:stop] = np.ravel(state[key])
+        return out
+
+    def unpack(self, flat):
+        """Split a (batch, size) tensor into model inputs with a leading batch axis."""
+        # Column slices are strided views; MPS convolutions run far slower on them.
+        return {key: flat[:, start:stop].reshape(-1, *shape).contiguous()
+                for key, start, stop, shape in self.fields}
 
 
 def encode_state(representation, game, grid_width, grid_height):
