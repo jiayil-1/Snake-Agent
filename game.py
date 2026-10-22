@@ -36,6 +36,8 @@ PROGRESS_PENALTY = DEFAULT_REWARDS['progress_penalty']
 FOOD_REWARD = DEFAULT_REWARDS['food_reward']
 COLLISION_PENALTY = DEFAULT_REWARDS['collision_penalty']
 TIMEOUT_PENALTY = DEFAULT_REWARDS['timeout_penalty']
+WIN_REWARD = DEFAULT_REWARDS['win_reward']
+
 
 class SnakeGameAI:
 
@@ -80,11 +82,16 @@ class SnakeGameAI:
 
 
     def _place_food(self):
-        x = random.randint(0, (self.w-BLOCK_SIZE )//BLOCK_SIZE )*BLOCK_SIZE
-        y = random.randint(0, (self.h-BLOCK_SIZE )//BLOCK_SIZE )*BLOCK_SIZE
-        self.food = Point(x, y)
-        if self.food in self.snake:
-            self._place_food()
+        """Place food on a random free cell; return False when the snake fills the board."""
+        occupied = set(self.snake)
+        free = [Point(x * BLOCK_SIZE, y * BLOCK_SIZE)
+                for y in range(self.h // BLOCK_SIZE)
+                for x in range(self.w // BLOCK_SIZE)
+                if Point(x * BLOCK_SIZE, y * BLOCK_SIZE) not in occupied]
+        if not free:
+            return False
+        self.food = random.choice(free)
+        return True
 
 
     def play_step(self, action):
@@ -126,7 +133,11 @@ class SnakeGameAI:
         if ate_food:
             self.score += 1
             reward += self.rewards['food_reward']
-            self._place_food()
+            if not self._place_food():
+                game_over = True
+                self.end_reason = 'win'
+                reward += self.rewards['win_reward']
+                return reward, game_over, self.score
         else:
             reward += self._distance_delta_reward(prev_distance)
             

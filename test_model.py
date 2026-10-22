@@ -289,6 +289,7 @@ class RewardConfigurationTests(unittest.TestCase):
             'food_reward': 7,
             'collision_penalty': -13,
             'timeout_penalty': -9,
+            'win_reward': 50,
         }
 
     def prepare_game(self, game, head, food):
@@ -334,6 +335,20 @@ class RewardConfigurationTests(unittest.TestCase):
         game.frame_iteration = 100 * len(game.snake)
         self.assertEqual(game.play_step([1, 0, 0])[:2], (-11, True))
         self.assertEqual(game.end_reason, 'timeout')
+
+    def test_eating_the_last_free_cell_wins(self):
+        game = SnakeGameAI(w=80, h=20, render=False, rewards=self.rewards)
+        self.prepare_game(game, Point(40, 0), Point(60, 0))
+        self.assertEqual(game.play_step([1, 0, 0]), (55, True, 1))
+        self.assertEqual(game.end_reason, 'win')
+
+    def test_food_lands_on_the_only_free_cell(self):
+        game = SnakeGameAI(w=200, h=200, render=False)
+        free = Point(120, 60)
+        game.snake = [Point(x, y) for y in range(0, 200, 20) for x in range(0, 200, 20)
+                      if Point(x, y) != free]
+        self.assertTrue(game._place_food())
+        self.assertEqual(game.food, free)
 
 
 if __name__ == '__main__':

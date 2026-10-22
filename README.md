@@ -63,7 +63,8 @@ Add another top-level entry to `models.json`. For example, this preset changes t
     "progress_penalty": -0.1,
     "food_reward": 8,
     "collision_penalty": -12,
-    "timeout_penalty": -4
+    "timeout_penalty": -4,
+    "win_reward": 100
   },
   "architecture_options": {
     "channels": 48,
@@ -143,7 +144,7 @@ python agent.py --games 1000 --checkpoint model/experiment.pth --csv output/scor
 
 Use `--reset-epsilon` to start the run with epsilon at `1.0`; it then decays by completed game as usual. This preserves the loaded model and cumulative game number.
 
-Run from the repository directory because the checkpoint and score paths are relative to the current working directory. Training appends each game's number, score, and ending reason to `training_scores.csv`, and prints the ending reason in the command-line game summary. The reason is `timeout`, `self-collision`, or `wall-collision`. Existing rows keep their game and score values and have a blank ending reason because their causes were not recorded. On startup, the agent reads the final logged game number and continues numbering from there. The plotter calculates the rolling mean from the scores when it generates the chart. Move or rename the CSV before a run if you want a separate log that starts at game 1.
+Run from the repository directory because the checkpoint and score paths are relative to the current working directory. Training appends each game's number, score, and ending reason to `training_scores.csv`, and prints the ending reason in the command-line game summary. The reason is `timeout`, `self-collision`, `wall-collision`, or `win` when the snake fills the board; a win adds `win_reward` on top of the final food reward. Existing rows keep their game and score values and have a blank ending reason because their causes were not recorded. On startup, the agent reads the final logged game number and continues numbering from there. The plotter calculates the rolling mean from the scores when it generates the chart. Move or rename the CSV before a run if you want a separate log that starts at game 1.
 
 ## Plot training scores
 

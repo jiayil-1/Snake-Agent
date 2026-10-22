@@ -7,4 +7,5 @@ DEFAULT_REWARDS = {
     'food_reward': 10,
     'collision_penalty': -10,
     'timeout_penalty': -5,
+    'win_reward': 100,
 }

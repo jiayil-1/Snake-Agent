@@ -13,7 +13,8 @@
       "progress_penalty": 0,
       "food_reward": 10,
       "collision_penalty": -10,
-      "timeout_penalty": -5
+      "timeout_penalty": -5,
+      "win_reward": 100
     },
     "architecture_options": {
       "channels": 32,
@@ -52,7 +53,8 @@
       "progress_penalty": 0,
       "food_reward": 10,
       "collision_penalty": -10,
-      "timeout_penalty": -5
+      "timeout_penalty": -5,
+      "win_reward": 100
     },
     "architecture_options": {
       "hidden_sizes": [128, 128]
