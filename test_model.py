@@ -18,7 +18,7 @@ from torch import nn
 
 from agent import Agent, save_checkpoint_atomic
 from game import BLOCK_SIZE, Direction, Point, SnakeGameAI
-from model import Linear_QNet, QTrainer
+from model import Linear_QNet, QTrainer, RawSkip_QNet
 
 
 class ResidualModelTests(unittest.TestCase):
@@ -281,6 +281,61 @@ class ResidualModelTests(unittest.TestCase):
                     self.assertEqual((agent.record, agent.n_games, agent.epsilon), (0, 0, 1.0))
                     self.assertEqual(path.read_bytes(), original_bytes)
                     self.assertEqual(len(agent.trainer.optimizer.state), 0)
+
+
+class RawSkipModelTests(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(7)
+        self.model = RawSkip_QNet(24, 32, 12, 3)
+
+    def test_full_resolution_convs_and_output_shapes(self):
+        for height, width in [(24, 32), (8, 12), (4, 4)]:
+            model = RawSkip_QNet(height, width, 12, 3)
+            board = torch.randn(2, 3, height, width)
+            metadata = torch.randn(2, 12)
+            observed = []
+            handles = [
+                layer.register_forward_hook(
+                    lambda module, inputs, output: observed.append(tuple(output.shape[1:]))
+                ) for layer in model.cnn.modules() if isinstance(layer, nn.Conv2d)
+            ]
+            try:
+                with torch.no_grad():
+                    batch = model({'board_state': board, 'metadata': metadata})
+            finally:
+                for handle in handles:
+                    handle.remove()
+            self.assertEqual(len(observed), 8)
+            self.assertTrue(all(shape == (6, height, width) for shape in observed[:-1]))
+            self.assertEqual(observed[-1], (3, height, width))
+            self.assertEqual(batch.shape, (2, 3))
+            self.assertEqual(model.cnn_fc[0].in_features, 3 * (height // 4) * (width // 4))
+            with torch.no_grad():
+                single = model({'board_state': board[0], 'metadata': metadata[0]})
+            torch.testing.assert_close(single, batch[:1])
+
+    def test_parameter_count(self):
+        self.assertEqual(sum(p.numel() for p in self.model.parameters()), 46796)
+
+    def test_raw_board_shortcut_and_gradients(self):
+        zero_branch = copy.deepcopy(self.model)
+        for parameter in zero_branch.cnn.parameters():
+            nn.init.zeros_(parameter)
+        board = torch.randn(2, 3, 24, 32)
+        pool = nn.MaxPool2d(2)
+        torch.testing.assert_close(
+            zero_branch.encode_board(board),
+            torch.flatten(pool(pool(torch.relu(board))), 1),
+        )
+
+        output = self.model({
+            'board_state': torch.randn(2, 3, 24, 32),
+            'metadata': torch.randn(2, 12),
+        })
+        output.square().mean().backward()
+        for name, parameter in self.model.named_parameters():
+            self.assertIsNotNone(parameter.grad, name)
+            self.assertTrue(torch.isfinite(parameter.grad).all(), name)
 
 
 class BatchedActionTests(unittest.TestCase):

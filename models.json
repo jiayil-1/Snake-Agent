@@ -40,6 +40,47 @@
       "min_lr": 0.00001
     }
   },
+  "raw_skip_cnn": {
+    "architecture": "raw_skip_cnn",
+    "state_representation": {
+      "encoder": "board_metadata",
+      "options": {
+        "body_encoding": "gradient"
+      }
+    },
+    "rewards": {
+      "step_penalty": 0,
+      "progress_reward": 0,
+      "progress_penalty": 0,
+      "food_reward": 10,
+      "collision_penalty": -10,
+      "timeout_penalty": -5,
+      "win_reward": 100
+    },
+    "architecture_options": {
+      "channels": 6,
+      "residual_blocks": 3,
+      "board_embedding_size": 128,
+      "metadata_embedding_size": 64,
+      "fusion_hidden_size": 128
+    },
+    "training": {
+      "max_memory": 100000,
+      "replay_batch_size": 256,
+      "replay_warmup": 1000,
+      "train_every": 16,
+      "parallel_games": 128,
+      "lr": 0.001,
+      "gamma": 0.97,
+      "epsilon_start": 1.0,
+      "epsilon_min": 0.01,
+      "epsilon_decay": 0.997,
+      "max_grad_norm": 5.0,
+      "lr_step_size": 500,
+      "lr_decay": 0.95,
+      "min_lr": 0.0001
+    }
+  },
   "mlp": {
     "architecture": "mlp",
     "state_representation": {

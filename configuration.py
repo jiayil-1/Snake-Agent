@@ -131,7 +131,7 @@ def resolve_preset(preset):
         sizes = options['hidden_sizes']
         if not isinstance(sizes, list) or not sizes or any(type(n) is not int or n < 1 for n in sizes):
             raise ValueError('hidden_sizes must be a nonempty array of positive integers')
-    if architecture == 'residual_cnn':
+    if architecture in ('residual_cnn', 'raw_skip_cnn'):
         for name in ('channels', 'residual_blocks', 'board_embedding_size',
                      'metadata_embedding_size', 'fusion_hidden_size'):
             if type(options[name]) is not int or options[name] < 1:

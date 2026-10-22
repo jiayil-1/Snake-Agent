@@ -113,6 +113,75 @@ class Linear_QNet(nn.Module):
         torch.save({'model_state_dict': self.state_dict(), 'metadata': default_metadata}, file_name)
 
 
+class RawSkip_QNet(nn.Module):
+    """DQN: full-resolution residual CNN with a raw-board skip + metadata MLP.
+
+    CNN: Conv(3→6) → ReLU → residual blocks(6) → Conv(6→3), all at native
+         grid size; add the raw board → ReLU → 2x MaxPool → flatten → Linear → 128
+    Metadata: Linear → 64
+    Fusion: Linear(192→128) → ReLU → Linear(128→output_size)
+    """
+
+    def __init__(self, board_height, board_width, metadata_size, output_size,
+                 channels=6, residual_blocks=3, board_embedding_size=128,
+                 metadata_embedding_size=64, fusion_hidden_size=128,
+                 state_spec=None):
+        super().__init__()
+        state_spec = state_spec or {
+            'has_board': True, 'board_channels': 3,
+            'board_height': board_height, 'board_width': board_width,
+            'metadata_size': metadata_size,
+        }
+        if not state_spec['has_board']:
+            raise ValueError('raw_skip_cnn requires a state representation with board input')
+        if state_spec['board_height'] < 4 or state_spec['board_width'] < 4:
+            raise ValueError('raw_skip_cnn requires board dimensions of at least 4 by 4')
+        board_channels = state_spec['board_channels']
+
+        # The last conv returns to the board's channel count so the raw board
+        # can be added as an identity shortcut.
+        self.cnn = nn.Sequential(
+            nn.Conv2d(board_channels, channels, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            *(ResidualBlock(channels) for _ in range(residual_blocks)),
+            nn.Conv2d(channels, board_channels, kernel_size=3, stride=1, padding=1),
+        )
+        self.skip_relu = nn.ReLU()
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        cnn_flat = board_channels * (state_spec['board_height'] // 4) * (state_spec['board_width'] // 4)
+        self.cnn_fc = nn.Sequential(
+            nn.Linear(cnn_flat, board_embedding_size),
+            nn.ReLU(),
+        )
+        self.meta_fc = nn.Sequential(
+            nn.Linear(state_spec['metadata_size'], metadata_embedding_size),
+            nn.ReLU(),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(board_embedding_size + metadata_embedding_size, fusion_hidden_size),
+            nn.ReLU(),
+            nn.Linear(fusion_hidden_size, output_size),
+        )
+
+    def encode_board(self, board_state):
+        features = self.skip_relu(self.cnn(board_state) + board_state)
+        return torch.flatten(self.pool(self.pool(features)), 1)
+
+    def forward(self, state):
+        board_state = state['board_state']
+        metadata = state['metadata']
+
+        if board_state.dim() == 3:
+            board_state = board_state.unsqueeze(0)
+        if metadata.dim() == 1:
+            metadata = metadata.unsqueeze(0)
+
+        board_emb = self.cnn_fc(self.encode_board(board_state))
+        meta_emb = self.meta_fc(metadata)
+        return self.head(torch.cat((board_emb, meta_emb), dim=1))
+
+
 class MLP_QNet(nn.Module):
     """Flatten the board and combine it with metadata before an MLP."""
 
@@ -152,10 +221,17 @@ class MLP_QNet(nn.Module):
 
 
 # Explicit registry: configuration never imports or evaluates arbitrary code.
-ARCHITECTURES = {'residual_cnn': Linear_QNet, 'mlp': MLP_QNet}
+ARCHITECTURES = {'residual_cnn': Linear_QNet, 'raw_skip_cnn': RawSkip_QNet, 'mlp': MLP_QNet}
 ARCHITECTURE_DEFAULTS = {
     'residual_cnn': {
         'channels': 32,
+        'residual_blocks': 3,
+        'board_embedding_size': 128,
+        'metadata_embedding_size': 64,
+        'fusion_hidden_size': 128,
+    },
+    'raw_skip_cnn': {
+        'channels': 6,
         'residual_blocks': 3,
         'board_embedding_size': 128,
         'metadata_embedding_size': 64,
@@ -165,6 +241,7 @@ ARCHITECTURE_DEFAULTS = {
 }
 ARCHITECTURE_CAPABILITIES = {
     'residual_cnn': {'requires_board': True},
+    'raw_skip_cnn': {'requires_board': True},
     'mlp': {'requires_board': False},
 }
 

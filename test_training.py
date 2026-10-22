@@ -28,7 +28,7 @@ from state import encode_state, get_observation_spec
 class ConfigurationTests(unittest.TestCase):
     def test_defaults_and_json_presets(self):
         presets = load_presets(Path(__file__).with_name('models.json'))
-        self.assertEqual(set(presets), {'residual_cnn', 'mlp'})
+        self.assertEqual(set(presets), {'residual_cnn', 'raw_skip_cnn', 'mlp'})
         cnn = presets['residual_cnn']
         self.assertEqual(cnn['training']['replay_batch_size'], 64)
         self.assertEqual(cnn['training']['replay_warmup'], 1000)
@@ -41,6 +41,9 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(cnn['rewards']['food_reward'], 10)
         self.assertEqual(cnn['architecture_options']['channels'], 32)
         self.assertEqual(resolve_preset(cnn), cnn)
+        raw_skip = presets['raw_skip_cnn']
+        self.assertEqual(raw_skip['architecture_options']['channels'], 6)
+        self.assertEqual(resolve_preset(raw_skip), raw_skip)
 
     def test_invalid_presets_fail(self):
         bad_presets = [
@@ -192,9 +195,9 @@ class ArchitectureTests(unittest.TestCase):
                          'torch.compile is only used on CUDA or MPS')
     def test_compiled_loss_matches_eager_updates(self):
         device = 'cuda' if torch.cuda.is_available() else 'mps'
-        config = resolve_preset({'architecture': 'residual_cnn'})
+        config = resolve_preset({'architecture': 'raw_skip_cnn'})
         spec = get_observation_spec(config['state_representation'], 24, 32)
-        eager_model = ARCHITECTURES['residual_cnn'](
+        eager_model = ARCHITECTURES['raw_skip_cnn'](
             24, 32, 12, 3, state_spec=spec, **config['architecture_options'],
         )
         compiled_model = copy.deepcopy(eager_model)
