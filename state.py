@@ -5,6 +5,15 @@ import math
 
 import numpy as np
 
+# Human-readable names for the encoded inputs, in the order the encoders emit them.
+BOARD_CHANNELS = ('head', 'food', 'body')
+METADATA_FEATURES = (
+    'dir L', 'dir R', 'dir U', 'dir D',
+    'danger S', 'danger R', 'danger L',
+    'food L', 'food R', 'food U', 'food D', 'food dist',
+)
+
+
 def _encode_board_metadata(game, grid_width, grid_height, options):
     from game import BLOCK_SIZE
 

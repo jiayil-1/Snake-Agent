@@ -461,6 +461,36 @@ class ScoreLogTests(unittest.TestCase):
             self.assertTrue(out.exists())
 
 
+class WeightPlotTests(unittest.TestCase):
+    def test_every_architecture_plots_and_maps_its_input_columns(self):
+        import visualize_weights
+
+        cases = [
+            ({'architecture': 'raw_skip_cnn'}, (3, 6, 8)),
+            ({'architecture': 'residual_cnn'}, (32, 6, 8)),
+            ({'architecture': 'mlp'}, (3, 24, 32)),
+            ({'architecture': 'mlp', 'state_representation': {'encoder': 'metadata_only'}}, None),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            for preset, board_shape in cases:
+                with self.subTest(preset=preset):
+                    config = resolve_preset(preset)
+                    spec = get_observation_spec(config['state_representation'], 24, 32)
+                    model = ARCHITECTURES[config['architecture']](
+                        24, 32, 12, 3, state_spec=spec, **config['architecture_options'])
+                    board_layer, shape, metadata_layer, columns = visualize_weights.input_layers(
+                        model, 24, 32)
+                    self.assertEqual(shape, board_shape)
+                    self.assertEqual(board_layer is None, board_shape is None)
+                    self.assertEqual(metadata_layer.weight[:, columns].shape[1], 12)
+
+                    checkpoint = Path(directory) / f'{len(os.listdir(directory))}.pth'
+                    torch.save({'model_state_dict': model.state_dict(), 'config': config}, checkpoint)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        visualize_weights.main(['--checkpoint', str(checkpoint)])
+                    self.assertTrue(checkpoint.with_name(f'{checkpoint.stem}_weights.png').exists())
+
+
 class TrainingCliTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()

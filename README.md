@@ -122,8 +122,31 @@ Import validates `model/model.pth`, copies it into both checkpoint slots, copies
 Plot a named run with the existing plotter:
 
 ```bash
-python plot_training_scores.py --csv runs/mlp/training_scores.csv --out runs/mlp/training_scores_plot.png
+python plot_training_scores.py --csv runs/<run-name>/training_scores.csv --out runs/<run-name>/training_scores_plot.png
 ```
+
+Render a checkpoint's learned weights to a PNG:
+
+```bash
+python visualize_weights.py --model raw_skip_cnn                      # runs/raw_skip_cnn/best_weights.png
+python visualize_weights.py --model raw_skip_cnn --checkpoint latest  # runs/raw_skip_cnn/latest_weights.png
+python visualize_weights.py --checkpoint model/model.pth --out weights.png
+```
+
+`--model`, `--run`, and `--checkpoint` select a checkpoint as in `inference.py`, and the output defaults to `<checkpoint name>_weights.png` beside it. Like inference, it reads a private snapshot, so it is safe to run during training. The image shows every 3×3 convolution kernel (rows are output channels, columns input channels), each dense weight matrix, and per-layer weight distributions. Two panels estimate what the network reads: board input importance maps each board cell, after the CNNs' two max-pools, to the L2 norm of its column in the first dense layer, per head, food, and body channel (or combined over the residual CNN's 32 feature channels), and metadata feature importance does the same for the 12 metadata inputs. Large weights only mean a strong connection; they do not show how often an input is active.
+
+## Evaluate a model
+
+`inference.py` plays games with the network's best move every step: no exploration, replay, training, or file writes. It copies the checkpoint to a temporary snapshot before loading, so it is safe to run while the same run is training.
+
+```bash
+python inference.py --model raw_skip_cnn                       # 100 headless games from best.pth
+python inference.py --model raw_skip_cnn --checkpoint latest --games 500 --seed 1
+python inference.py --run cnn-experiment --render --fps 15     # watch games one at a time
+python inference.py --checkpoint model/model.pth               # any checkpoint file
+```
+
+`--checkpoint` takes `best` (default), `latest`, or a file path. The network is rebuilt from the config saved in the checkpoint, falling back to the run's `config.json` or the `--model` preset for older checkpoints. Headless games run in lockstep batches of the run's `parallel_games`. `--start-length` and `--device` work as in training, and `--seed` makes food and start placement repeatable for comparing checkpoints. Each game's score, steps, and end reason are printed, followed by the mean, median, range, and end-reason counts.
 
 ## Legacy training
 
@@ -170,6 +193,7 @@ python plot_training_scores.py --csv training_scores.csv --out training_scores_p
 | File | Purpose |
 | --- | --- |
 | `train.py` | Shared command-line entrypoint for named model training and legacy import. |
+| `inference.py` | Greedy evaluation of a saved checkpoint, safe to run during training. |
 | `models.json` | Editable named architecture and training presets. |
 | `configuration.py` | Preset defaults, JSON loading, and validation. |
 | `state.py` | Registered observation encoders and their input-shape descriptions. |
