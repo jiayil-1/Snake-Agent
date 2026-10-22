@@ -225,6 +225,23 @@ class QTrainer:
     def current_lr(self):
         return self.optimizer.param_groups[0]['lr']
 
+    def apply_settings(self, settings):
+        """Reapply configured learning-rate settings after restoring saved state.
+
+        Loading optimizer and scheduler state restores the old base rate and
+        decay, so recompute the rate this schedule gives at the restored step.
+        """
+        self.lr = settings['lr']
+        self.scheduler.gamma = settings['lr_decay']
+        self.scheduler.base_lrs = [settings['lr'] for _ in self.optimizer.param_groups]
+        decays = self.scheduler.last_epoch // self.scheduler.step_size
+        lr = settings['lr'] * settings['lr_decay'] ** decays
+        if self.min_lr is not None:
+            lr = max(lr, self.min_lr)
+        for group in self.optimizer.param_groups:
+            group['initial_lr'] = settings['lr']
+            group['lr'] = lr
+
     @staticmethod
     def _keep_fused_adam(optimizer):
         # Loading replaces the live param-group flags with the saved ones, so

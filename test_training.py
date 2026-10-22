@@ -273,10 +273,21 @@ class ConfiguredAgentTests(unittest.TestCase):
             for key, value in agent.model.state_dict().items():
                 torch.testing.assert_close(value, restored.model.state_dict()[key])
 
+            # Tuned hyperparameters apply on resume, continuing the decay
+            # schedule from the restored step (one decay after three updates).
+            tuned = copy.deepcopy(config)
+            tuned['training'].update({'gamma': 0.7, 'lr': 0.004, 'lr_decay': 0.5})
+            resumed = Agent(config=tuned, device='cpu', checkpoint_path=path,
+                            strict_checkpoint=True)
+            self.assertEqual(resumed.trainer.gamma, 0.7)
+            self.assertEqual(resumed.trainer.optimizer_steps, 3)
+            self.assertAlmostEqual(resumed.trainer.current_lr(), 0.004 * 0.5)
+            self.assertEqual(resumed.trainer.scheduler.gamma, 0.5)
+
             changed = copy.deepcopy(config)
-            changed['training']['gamma'] = 0.7
+            changed['architecture_options']['hidden_sizes'] = [8]
             original = path.read_bytes()
-            with self.assertRaisesRegex(ValueError, 'configuration'):
+            with self.assertRaisesRegex(ValueError, 'architecture_options'):
                 Agent(config=changed, device='cpu', checkpoint_path=path, strict_checkpoint=True)
             self.assertEqual(path.read_bytes(), original)
 
@@ -535,13 +546,27 @@ train.main({import_args})
         with (first / 'training_scores.csv').open() as handle:
             self.assertEqual([int(row['game']) for row in csv.DictReader(handle)], [1, 2, 3])
 
-        before = {p.name: p.read_bytes() for p in first.iterdir()}
+        # Training settings may change between invocations; the run resumes
+        # with the new values and records them.
         self.presets['mlp']['training']['gamma'] = 0.5
         self.write_presets()
+        result = self.cli('--model', 'mlp', '--run', 'first', '--games', '1', '--device', 'cpu')
+        self.assertIn('training.gamma: 0.99 -> 0.5', result.stdout)
+        tuned = torch.load(first / 'latest.pth', weights_only=True)
+        self.assertEqual(tuned['metadata']['n_games'], 4)
+        self.assertEqual(tuned['config']['training']['gamma'], 0.5)
+        self.assertEqual(json.loads((first / 'config.json').read_text()), tuned['config'])
+
+        # Network-shape changes cannot reuse the checkpoint.
+        before = {p.name: p.read_bytes() for p in first.iterdir()}
+        self.presets['mlp']['architecture_options'] = {'hidden_sizes': [16]}
+        self.write_presets()
         error = self.cli('--model', 'mlp', '--run', 'first', '--games', '1', success=False)
+        self.assertIn('architecture_options', error.stderr)
         self.assertIn('new --run', error.stderr)
         self.assertEqual({p.name: p.read_bytes() for p in first.iterdir()}, before)
 
+        del self.presets['mlp']['architecture_options']
         del self.presets['mlp']['training']['gamma']
         self.write_presets()
         incompatible = torch.load(first / 'latest.pth', weights_only=True)
@@ -579,9 +604,24 @@ train.main({import_args})
         self.assertEqual(json.loads((run / 'config.json').read_text()), config)
         resumed = torch.load(run / 'latest.pth', weights_only=True)
         self.assertEqual(resumed['metadata']['n_games'], 2)
-        before = {path.name: path.read_bytes() for path in run.iterdir()}
+        # Changed rewards and hyperparameters resume the same run.
         self.presets['metadata-exp']['rewards']['food_reward'] = 7
+        self.presets['metadata-exp']['training'].update({'replay_batch_size': 2, 'lr': 0.0005})
         self.write_presets()
+        self.one_step_cli('--model', 'metadata-exp', '--games', '1', '--device', 'cpu')
+        self.assertEqual(sorted(path.name for path in (self.root / 'runs').iterdir()), ['metadata-exp'])
+        tuned = torch.load(run / 'latest.pth', weights_only=True)
+        self.assertEqual(tuned['metadata']['n_games'], 3)
+        self.assertEqual(tuned['config']['rewards']['food_reward'], 7)
+        self.assertEqual(tuned['config']['training']['replay_batch_size'], 2)
+        self.assertEqual(tuned['optimizer_state_dict']['param_groups'][0]['initial_lr'], 0.0005)
+        self.assertEqual(json.loads((run / 'config.json').read_text()), tuned['config'])
+
+        self.presets['metadata-exp']['state_representation'] = {'encoder': 'board_metadata'}
+        self.presets['metadata-exp']['architecture'] = 'residual_cnn'
+        del self.presets['metadata-exp']['architecture_options']
+        self.write_presets()
+        before = {path.name: path.read_bytes() for path in run.iterdir()}
         error = self.cli('--model', 'metadata-exp', '--games', '1', success=False)
         self.assertIn('new --run', error.stderr)
         self.assertEqual({path.name: path.read_bytes() for path in run.iterdir()}, before)
@@ -632,16 +672,16 @@ train.main({import_args})
         self.write_presets()
         error = self.cli('--model', 'custom-state', '--run', 'custom-state',
                          '--import-legacy', '--device', 'cpu', success=False)
-        self.assertIn('nondefault state or rewards cannot be verified', error.stderr)
+        self.assertIn('nondefault state cannot be verified', error.stderr)
         self.assertFalse((self.root / 'runs' / 'custom-state').exists())
         self.presets['custom-rewards'] = {
             'architecture': 'residual_cnn', 'rewards': {'food_reward': 12},
         }
         self.write_presets()
-        error = self.cli('--model', 'custom-rewards', '--run', 'custom-rewards',
-                         '--import-legacy', '--device', 'cpu', success=False)
-        self.assertIn('nondefault state or rewards cannot be verified', error.stderr)
-        self.assertFalse((self.root / 'runs' / 'custom-rewards').exists())
+        # Rewards are tunable, so a legacy checkpoint can resume under new ones.
+        self.cli('--model', 'custom-rewards', '--run', 'custom-rewards',
+                 '--import-legacy', '--device', 'cpu')
+        self.assertTrue((self.root / 'runs' / 'custom-rewards' / 'latest.pth').exists())
         self.cli('--model', 'residual_cnn', '--run', 'legacy', '--import-legacy', '--device', 'cpu')
         run = self.root / 'runs' / 'legacy'
         self.assertEqual((run / 'latest.pth').read_bytes(), originals[0])

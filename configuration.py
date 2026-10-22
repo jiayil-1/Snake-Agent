@@ -37,6 +37,26 @@ def validate_name(name):
     return name
 
 
+# Settings that determine the network and its inputs; a checkpoint can only
+# resume under the same values. Rewards and training settings may change.
+CHECKPOINT_SHAPE_KEYS = ('architecture', 'architecture_options', 'state_representation')
+
+
+def tunable_changes(saved, config):
+    """List 'section.name: old -> new' for changed rewards and training settings."""
+    return [
+        f'{section}.{name}: {saved[section].get(name)!r} -> {value!r}'
+        for section in ('rewards', 'training')
+        for name, value in config[section].items()
+        if saved[section].get(name) != value
+    ]
+
+
+def shape_conflicts(saved, config):
+    """Names of settings whose change makes an existing checkpoint unusable."""
+    return [key for key in CHECKPOINT_SHAPE_KEYS if saved[key] != config[key]]
+
+
 def positive_int(value):
     try:
         parsed = int(value)

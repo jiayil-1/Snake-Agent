@@ -9,8 +9,8 @@ import shutil
 import tempfile
 
 from configuration import (
-    REPO_ROOT, epsilon_ramp_arg, load_presets, positive_int, resolve_preset, start_length_arg,
-    validate_name,
+    REPO_ROOT, epsilon_ramp_arg, load_presets, positive_int, resolve_preset, shape_conflicts,
+    start_length_arg, tunable_changes, validate_name,
 )
 from model import resolve_device
 
@@ -28,8 +28,13 @@ def prepare_run(config, run_dir, device, compile_model=True):
             saved_config = resolve_preset(json.loads(snapshot.read_text()))
         except ValueError as err:
             raise ValueError(f'Run configuration is invalid: {err}') from err
-        if saved_config != config:
-            raise ValueError('Run configuration differs from this preset; use a new --run name')
+        conflicts = shape_conflicts(saved_config, config)
+        if conflicts:
+            raise ValueError(
+                f'Run checkpoint cannot use this preset\'s changed {", ".join(conflicts)}; '
+                'use a new --run name'
+            )
+        changes = tunable_changes(saved_config, config)
         if not latest.exists() and (run_dir / 'best.pth').exists():
             raise ValueError('Run is missing latest.pth; restore it before resuming')
         if not latest.exists() and read_last_game_number(run_dir / 'training_scores.csv'):
@@ -42,11 +47,20 @@ def prepare_run(config, run_dir, device, compile_model=True):
     # Validate CSV parsing before training can overwrite a checkpoint.
     read_last_game_number(run_dir / 'training_scores.csv')
     run_dir.mkdir(parents=True, exist_ok=True)
-    if not snapshot.exists():
-        with snapshot.open('x') as config_file:
-            json.dump(config, config_file, indent=2, allow_nan=False)
-            config_file.write('\n')
+    if snapshot.exists():
+        if changes:
+            print('Resuming with updated settings:\n  ' + '\n  '.join(changes), flush=True)
+            write_config(snapshot, config)
+    else:
+        write_config(snapshot, config)
     return agent
+
+
+def write_config(path, config):
+    """Replace the run's configuration snapshot atomically."""
+    temp = path.with_name(path.name + '.tmp')
+    temp.write_text(json.dumps(config, indent=2, allow_nan=False) + '\n')
+    os.replace(temp, path)
 
 
 def import_legacy(config, run_dir, device):

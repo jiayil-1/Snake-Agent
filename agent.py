@@ -11,8 +11,8 @@ from collections import deque
 from game import SnakeGameAI, Direction, Point, BLOCK_SIZE, validate_start_length
 from model import ARCHITECTURES, QTrainer, resolve_device
 from configuration import (
-    DEFAULT_TRAINING, epsilon_ramp_arg, positive_int, resolve_preset, start_length_arg,
-    validate_epsilon_ramp,
+    DEFAULT_TRAINING, epsilon_ramp_arg, positive_int, resolve_preset, shape_conflicts,
+    start_length_arg, validate_epsilon_ramp,
 )
 from helper import append_score, ensure_score_columns, plot
 from state import StateLayout, encode_resolved_state, get_observation_spec
@@ -149,16 +149,17 @@ class Agent:
                     saved_config = resolve_preset(saved_config)
                 except ValueError as err:
                     raise ValueError(f'Checkpoint configuration is invalid: {err}') from err
-                if saved_config != self.config:
+                conflicts = shape_conflicts(saved_config, self.config)
+                if conflicts:
                     raise ValueError(
-                        'Checkpoint configuration differs from this preset; use a new --run name'
+                        f'Checkpoint cannot use this preset\'s changed {", ".join(conflicts)}; '
+                        'use a new --run name'
                     )
             else:
                 default_semantics = resolve_preset({'architecture': self.config['architecture']})
-                if (self.config['state_representation'] != default_semantics['state_representation']
-                        or self.config['rewards'] != default_semantics['rewards']):
+                if self.config['state_representation'] != default_semantics['state_representation']:
                     raise ValueError(
-                        'Checkpoint has no experiment config; nondefault state or rewards cannot be verified'
+                        'Checkpoint has no experiment config; nondefault state cannot be verified'
                     )
         model_state = checkpoint['model_state_dict'] if wrapped else checkpoint
         # Strict loading can copy matching tensors before reporting a mismatch.
@@ -203,6 +204,8 @@ class Agent:
                     if self.strict_checkpoint:
                         raise ValueError(f'Scheduler state mismatch: {err}') from err
                     print(f'Scheduler state mismatch ({err}). Continuing with fresh scheduler state.')
+
+            self.trainer.apply_settings(self.config['training'])
 
             training_state = checkpoint.get('training_state', {})
             self.environment_steps = training_state.get('environment_steps', 0)
