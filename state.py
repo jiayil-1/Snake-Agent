@@ -19,11 +19,13 @@ def _encode_board_metadata(game, grid_width, grid_height, options):
     if 0 <= fx < grid_width and 0 <= fy < grid_height:
         board[1, fy, fx] = 1.0
 
+    # The gradient runs from 1 at the head to 0.5 at the tail, so every
+    # segment, including the tail, stays distinct from empty cells.
     denominator = max(1, snake_len - 1)
     for index, segment in enumerate(game.snake):
         x, y = int(segment.x // BLOCK_SIZE), int(segment.y // BLOCK_SIZE)
         if 0 <= x < grid_width and 0 <= y < grid_height:
-            value = 1.0 if options['body_encoding'] == 'binary' else 1.0 - index / denominator
+            value = 1.0 if options['body_encoding'] == 'binary' else 1.0 - 0.5 * index / denominator
             board[2, y, x] = value
 
     return {'board_state': board, 'metadata': _metadata(game, head, grid_width, grid_height)}

@@ -23,8 +23,8 @@ class ResidualBlock(nn.Module):
 class Linear_QNet(nn.Module):
     """DQN: pooled residual CNN with a pooled stem skip + metadata MLP.
 
-    Board input: 3 channels (head, food, head-to-tail body gradient), values
-    in [0, 1], native grid size.
+    Board input: 3 channels (head, food, head-to-tail body gradient 1 → 0.5),
+    values in [0, 1], native grid size.
     CNN: Conv(3→32) → ReLU → 2x MaxPool → 3 residual blocks + pooled skip
          → flatten → Linear → 128
     Metadata: Linear → 64

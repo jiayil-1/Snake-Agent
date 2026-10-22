@@ -118,7 +118,8 @@ class ArchitectureTests(unittest.TestCase):
         expected_board[0, 12, 16] = 1.0
         expected_board[1, int(game.food.y // 20), int(game.food.x // 20)] = 1.0
         expected_board[2, 12, 16] = 1.0
-        expected_board[2, 12, 15] = 0.5
+        expected_board[2, 12, 15] = 0.75
+        expected_board[2, 12, 14] = 0.5
         expected_metadata = np.array([
             0, 1, 0, 0, 0, 0, 0,
             int(game.food.x < head.x), int(game.food.x > head.x),
