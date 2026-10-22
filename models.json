@@ -8,7 +8,7 @@
       }
     },
     "rewards": {
-      "step_penalty": -0.01,
+      "step_penalty": 0,
       "progress_reward": 0,
       "progress_penalty": 0,
       "food_reward": 10,
@@ -30,14 +30,14 @@
       "train_every": 4,
       "parallel_games": 128,
       "lr": 0.0001,
-      "gamma": 0.99,
+      "gamma": 0.97,
       "epsilon_start": 1.0,
       "epsilon_min": 0.001,
       "epsilon_decay": 0.997,
       "max_grad_norm": 5.0,
       "lr_step_size": 500,
       "lr_decay": 0.95,
-      "min_lr": 0.00001
+      "min_lr": 0.0001
     }
   },
   "raw_skip_cnn": {
