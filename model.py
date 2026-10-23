@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import os
+from copy import deepcopy
 from datetime import datetime
 
 
@@ -260,7 +261,7 @@ def resolve_device(device='auto'):
 
 
 class QTrainer:
-    """Standard DQN trainer with TD learning."""
+    """Double DQN trainer with a soft-updated target network."""
 
     def __init__(
         self,
@@ -271,15 +272,19 @@ class QTrainer:
         lr_step_size=500,
         lr_decay=0.95,
         min_lr=1e-5,
+        target_update_tau=0.005,
         device='auto',
         compile_model=True,
     ):
         self.lr = lr
         self.gamma = gamma
         self.min_lr = min_lr
+        self.target_update_tau = target_update_tau
         self.device = resolve_device(device)
         print(f'Using {self.device} to train')
         self.model = model.to(self.device)
+        # A lagging copy scores next states so each update does not chase its own change.
+        self.target_model = deepcopy(self.model).requires_grad_(False)
         self.max_grad_norm = max_grad_norm
         # One fused kernel replaces several launches per parameter tensor.
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr, fused=True)
@@ -331,12 +336,26 @@ class QTrainer:
                 if 'step' in state:
                     state['step'] = state['step'].to(device=parameter.device, dtype=torch.float32)
 
+    def sync_target(self):
+        """Copy the online weights into the target network."""
+        self.target_model.load_state_dict(self.model.state_dict())
+
+    @torch.no_grad()
+    def update_target(self):
+        """Move the target weights a ``target_update_tau`` share toward the online weights."""
+        torch._foreach_lerp_(list(self.target_model.parameters()),
+                             list(self.model.parameters()), self.target_update_tau)
+
     @staticmethod
-    def build_td_target(predictions, actions, rewards, next_q_values, dones, gamma):
-        """Build DQN targets while changing only the action index selected per row."""
+    def build_td_target(predictions, actions, rewards, next_online_q, next_target_q, dones, gamma):
+        """Build Double DQN targets while changing only the action index selected per row.
+
+        The online network picks each next action and the target network values it.
+        """
         done_mask = dones.to(predictions.dtype)
-        max_next_q = torch.max(next_q_values, dim=1).values
-        target_q = rewards + (1.0 - done_mask) * gamma * max_next_q
+        next_actions = next_online_q.argmax(dim=1, keepdim=True)
+        next_q = next_target_q.gather(1, next_actions).squeeze(1)
+        target_q = rewards + (1.0 - done_mask) * gamma * next_q
 
         target = predictions.detach().clone()
         target.scatter_(1, actions.unsqueeze(1), target_q.unsqueeze(1))
@@ -346,11 +365,11 @@ class QTrainer:
         # Current Q-values
         pred = self.model(state)
 
-        # TD target: r + γ·max Q(s', a')
+        # TD target: r + γ·Q_target(s', argmax_a' Q(s', a'))
         with torch.no_grad():
-            next_q = self.model(next_state)
             target = self.build_td_target(
-                pred, action, reward, next_q, done, self.gamma,
+                pred, action, reward, self.model(next_state),
+                self.target_model(next_state), done, self.gamma,
             )
         return self.criterion(pred, target)
 
@@ -373,7 +392,7 @@ class QTrainer:
         )
 
     def train_batch(self, state, action, reward, next_state, done):
-        """Standard TD learning: Q(s,a) ← r + γ·max_a' Q(s',a')
+        """Double DQN update, then a soft target-network update.
 
         Inputs are batched tensors on the training device; actions are indices.
         """
@@ -382,6 +401,7 @@ class QTrainer:
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
         self.optimizer.step()
+        self.update_target()
         self.scheduler.step()
         self.optimizer_steps += 1
 

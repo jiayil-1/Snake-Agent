@@ -37,7 +37,8 @@
       "max_grad_norm": 5.0,
       "lr_step_size": 500,
       "lr_decay": 0.95,
-      "min_lr": 0.0001
+      "min_lr": 0.0001,
+      "target_update_tau": 0.005
     }
   },
   "raw_skip_cnn": {

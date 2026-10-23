@@ -127,7 +127,8 @@ class Agent:
             self.model, gamma=self.gamma, device=self.device.type,
             compile_model=compile_model,
             **{key: settings[key] for key in
-               ('lr', 'max_grad_norm', 'lr_step_size', 'lr_decay', 'min_lr')},
+               ('lr', 'max_grad_norm', 'lr_step_size', 'lr_decay', 'min_lr',
+                'target_update_tau')},
         )
         self._load_checkpoint(checkpoint_path)
 
@@ -173,8 +174,22 @@ class Agent:
             print(f'Checkpoint architecture mismatch ({err}). Starting with a fresh model.')
             return
         self.model.load_state_dict(candidate.state_dict())
+        self.trainer.sync_target()
 
         if wrapped:
+            # Checkpoints saved before the target network existed start it from the model.
+            target_state = checkpoint.get('target_model_state_dict')
+            if target_state is not None:
+                candidate = deepcopy(self.trainer.target_model)
+                try:
+                    candidate.load_state_dict(target_state)
+                except RuntimeError as err:
+                    if self.strict_checkpoint:
+                        raise ValueError(f'Target network mismatch: {err}') from err
+                    print(f'Target network mismatch ({err}). Starting it from the model.')
+                else:
+                    self.trainer.target_model.load_state_dict(candidate.state_dict())
+
             optimizer_state = checkpoint.get('optimizer_state_dict')
             if optimizer_state is not None:
                 try:
@@ -314,6 +329,7 @@ def save_checkpoint_atomic(agent, metadata=None,
 
     checkpoint = {
         'model_state_dict': agent.model.state_dict(),
+        'target_model_state_dict': agent.trainer.target_model.state_dict(),
         'optimizer_state_dict': agent.trainer.optimizer.state_dict(),
         'scheduler_state_dict': agent.trainer.scheduler.state_dict(),
         'training_state': {

@@ -17,6 +17,7 @@ import numpy as np
 from torch import nn
 
 from agent import Agent, save_checkpoint_atomic
+from configuration import resolve_preset
 from game import BLOCK_SIZE, Direction, Point, SnakeGameAI
 from model import Linear_QNet, QTrainer, RawSkip_QNet
 
@@ -136,17 +137,22 @@ class ResidualModelTests(unittest.TestCase):
         )
         actions = torch.tensor([1, 2, 0])
         rewards = torch.tensor([0.5, -2.0, 3.0])
-        next_q_values = torch.tensor(
+        next_online_q = torch.tensor(
             [[2.0, 4.0, 1.0], [8.0, 3.0, 4.0], [-2.0, 1.0, 0.0]],
+        )
+        next_target_q = torch.tensor(
+            [[5.0, -1.0, 6.0], [0.0, 2.0, 1.0], [3.0, 0.5, 9.0]],
         )
         dones = torch.tensor([False, True, False])
 
         observed = QTrainer.build_td_target(
-            predictions, actions, rewards, next_q_values, dones, gamma=0.9,
+            predictions, actions, rewards, next_online_q, next_target_q, dones, gamma=0.9,
         )
         expected = predictions.detach().clone()
         for row in range(len(dones)):
-            next_value = 0.0 if dones[row] else 0.9 * next_q_values[row].max()
+            # The online network chooses the next action; the target network values it.
+            next_action = next_online_q[row].argmax()
+            next_value = 0.0 if dones[row] else 0.9 * next_target_q[row, next_action]
             expected[row, actions[row]] = rewards[row] + next_value
 
         torch.testing.assert_close(observed, expected)
@@ -195,6 +201,8 @@ class ResidualModelTests(unittest.TestCase):
             self.assertEqual(restored.trainer.current_lr(), agent.trainer.current_lr())
             for key, value in agent.model.state_dict().items():
                 torch.testing.assert_close(value, restored.model.state_dict()[key])
+            for key, value in agent.trainer.target_model.state_dict().items():
+                torch.testing.assert_close(value, restored.trainer.target_model.state_dict()[key])
             self.assertEqual(len(restored.trainer.optimizer.state),
                              len(agent.trainer.optimizer.state))
 
@@ -462,6 +470,65 @@ class ReplayMemoryTests(unittest.TestCase):
         compact = StateLayout({**spec, 'has_board': False, 'board_channels': 0})
         self.assertEqual([field[0] for field in compact.fields], ['metadata'])
         self.assertEqual(compact.size, 12)
+
+
+class TargetNetworkTests(unittest.TestCase):
+    def train_agent(self, steps=6):
+        agent = Agent(replay_batch_size=2, replay_warmup=2, train_every=1, device='cpu')
+        game = SnakeGameAI(render=False)
+        for _ in range(steps):
+            state = agent.get_state(game)
+            reward, done, _ = game.play_step([1, 0, 0])
+            agent.remember(state, [1, 0, 0], reward, agent.get_state(game), done)
+            agent.train_long_memory()
+            if done:
+                game.reset()
+        return agent
+
+    def test_target_starts_as_copy_and_lags_by_tau(self):
+        torch.manual_seed(3)
+        model = Linear_QNet(24, 32, 12, 3)
+        trainer = QTrainer(model, lr=0.01, gamma=0.9, target_update_tau=0.25,
+                           device='cpu', compile_model=False)
+        for online, target in zip(model.parameters(), trainer.target_model.parameters()):
+            torch.testing.assert_close(target, online)
+            self.assertNotEqual(target.data_ptr(), online.data_ptr())
+            self.assertFalse(target.requires_grad)
+
+        before = [p.detach().clone() for p in trainer.target_model.parameters()]
+        batch = (
+            {'board_state': torch.rand(4, 3, 24, 32), 'metadata': torch.rand(4, 12)},
+            torch.tensor([0, 1, 2, 0]), torch.rand(4),
+            {'board_state': torch.rand(4, 3, 24, 32), 'metadata': torch.rand(4, 12)},
+            torch.zeros(4),
+        )
+        trainer.train_batch(*batch)
+        for old, online, target in zip(before, model.parameters(),
+                                       trainer.target_model.parameters()):
+            torch.testing.assert_close(target, old + 0.25 * (online.detach() - old))
+        self.assertFalse(all(torch.equal(online, target) for online, target
+                             in zip(model.parameters(), trainer.target_model.parameters())))
+
+    def test_checkpoint_without_target_starts_target_from_model(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.chdir(directory):
+            agent = self.train_agent()
+            save_checkpoint_atomic(agent)
+            checkpoint = torch.load('model/model.pth', weights_only=True)
+            del checkpoint['target_model_state_dict']
+            torch.save(checkpoint, 'no_target.pth')
+
+            restored = Agent(replay_batch_size=2, replay_warmup=2, train_every=1,
+                             device='cpu', checkpoint_path='no_target.pth')
+            for key, value in agent.model.state_dict().items():
+                torch.testing.assert_close(restored.trainer.target_model.state_dict()[key], value)
+
+    def test_target_update_tau_is_configurable_and_validated(self):
+        config = resolve_preset({'architecture': 'mlp', 'training': {'target_update_tau': 1}})
+        agent = Agent(config=config, device='cpu', checkpoint_path='missing.pth')
+        self.assertEqual(agent.trainer.target_update_tau, 1)
+        for tau in (0, 1.5, -0.1):
+            with self.subTest(tau=tau), self.assertRaises(ValueError):
+                resolve_preset({'architecture': 'mlp', 'training': {'target_update_tau': tau}})
 
 
 class FusedOptimizerTests(unittest.TestCase):

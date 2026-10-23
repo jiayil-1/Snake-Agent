@@ -28,6 +28,9 @@ DEFAULT_TRAINING = {
     'lr_step_size': 500,
     'lr_decay': 0.95,
     'min_lr': 0.00001,
+    # Share of the online weights blended into the target network per update;
+    # 1 makes the target track the online network exactly.
+    'target_update_tau': 0.005,
 }
 
 
@@ -163,7 +166,7 @@ def resolve_preset(preset):
         elif name in ('gamma', 'epsilon_start', 'epsilon_min'):
             if not 0 <= value <= 1:
                 raise ValueError(f'{name} must be between 0 and 1')
-        elif name in ('epsilon_decay', 'lr_decay'):
+        elif name in ('epsilon_decay', 'lr_decay', 'target_update_tau'):
             if not 0 < value <= 1:
                 raise ValueError(f'{name} must be greater than 0 and at most 1')
         elif value <= 0:
