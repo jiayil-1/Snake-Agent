@@ -263,10 +263,6 @@ class Agent:
         self.trainer.train_batch(*self.memory.sample(self.replay_batch_size, self.device))
         return True
 
-    def train_short_memory(self, state, action, reward, next_state, done):
-        """Keep the legacy immediate single-transition update API available."""
-        self.trainer.train_step(state, action, reward, next_state, done)
-
     def get_action(self, state):
         """Epsilon-greedy action selection."""
         return self.get_actions([state])[0]
