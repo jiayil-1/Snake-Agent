@@ -13,7 +13,7 @@
       "progress_penalty": 0,
       "food_reward": 10,
       "collision_penalty": -10,
-      "timeout_penalty": -5,
+      "timeout_penalty": -10,
       "win_reward": 100
     },
     "architecture_options": {
@@ -75,7 +75,7 @@
       "train_every": 16,
       "parallel_games": 128,
       "lr": 0.001,
-      "gamma": 0.97,
+      "gamma": 0.995,
       "epsilon_start": 1.0,
       "epsilon_min": 0.01,
       "epsilon_decay": 0.997,
