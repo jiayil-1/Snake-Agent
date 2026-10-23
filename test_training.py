@@ -514,6 +514,87 @@ class ScoreLogTests(unittest.TestCase):
             self.assertTrue(out.exists())
 
 
+class DeathLogTests(unittest.TestCase):
+    def test_final_boards_round_trip_and_viewer_draws_and_sorts_them(self):
+        import pygame
+        from death_viewer import PATH, RANDOM_HEAD, RANDOM_INNER, DeathViewer, move_label
+        from deaths import append_death, death_record, read_deaths, snake_cells
+        from game import BLOCK_SIZE, BLUE2, RED, Point, SnakeGameAI
+
+        game = SnakeGameAI(render=False)
+        game.food = Point(0, 0)  # Off the path, so the snake keeps its length.
+        done = False
+        while not done:
+            _, done, _ = game.play_step([1, 0, 0])
+        self.assertEqual(game.end_reason, 'wall-collision')
+        steps = game.frame_iteration
+        # The first move's segment has left through the tail; the last two remain.
+        crashed = death_record(game, 7, 0.5, 0.25, random_steps=[1, steps - 1, steps])
+        cells = [(int(p.x // BLOCK_SIZE), int(p.y // BLOCK_SIZE)) for p in game.snake]
+        self.assertEqual(snake_cells(crashed), cells)
+        self.assertEqual(cells[0], (32, 12))  # The head left the 32-cell-wide board.
+        self.assertEqual((crashed['board'], crashed['epsilon'], crashed['epsilon_scale'],
+                          crashed['random_move']), ([32, 24], 0.5, 0.25, True))
+        self.assertEqual((crashed['random_moves'], crashed['random_segments']), (3, [0, 1]))
+
+        game.reset()
+        game.play_step([0, 1, 0])
+        game.score = 9
+        later = death_record(game, 8, 0.1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'deaths.jsonl'
+            append_death(path, crashed)
+            append_death(path, later)
+            complete = path.stat().st_size
+            with path.open('a') as handle:
+                handle.write('{"game": 9')  # Training is still writing this line.
+            records, offset = read_deaths(path)
+            self.assertEqual((records, offset), ([crashed, later], complete))
+
+            viewer = DeathViewer(path)
+            self.assertEqual([r['game'] for r in viewer.order], [8, 7])
+            viewer.sort_by('score')
+            self.assertEqual(viewer.selected['game'], 8)
+            viewer.handle(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_DOWN))
+            self.assertEqual(viewer.selected['game'], 7)
+            viewer.handle(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_m))
+            self.assertEqual([move_label(r) for r in viewer.order], ['greedy', 'random'])
+            self.assertEqual(move_label({'game': 1}), '-')  # Logged before moves were tracked.
+            viewer.handle(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_s))
+            viewer.handle(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_DOWN))
+
+            surface = pygame.Surface(viewer.size)
+            viewer.draw(surface)
+            # The off-board head is drawn in the wall ring and outlined as the collision.
+            head = viewer.board.x + 32 * BLOCK_SIZE, viewer.board.y + 12 * BLOCK_SIZE
+            self.assertEqual(surface.get_at((head[0], head[1] + 8))[:3], RED)
+            tail = cells[-1]
+            tail_pixel = (viewer.board.x + tail[0] * BLOCK_SIZE + 5,
+                          viewer.board.y + tail[1] * BLOCK_SIZE + 5)
+            self.assertEqual(surface.get_at(tail_pixel)[:3], BLUE2)
+            # Segments placed by random moves are drawn green.
+            neck = cells[1]
+            neck_pixel = (viewer.board.x + neck[0] * BLOCK_SIZE + 5,
+                          viewer.board.y + neck[1] * BLOCK_SIZE + 5)
+            self.assertEqual(surface.get_at(neck_pixel)[:3], RANDOM_INNER)
+            self.assertEqual(surface.get_at((head[0] + 5, head[1] + 5))[:3], RANDOM_HEAD)
+
+            # The path runs through segment centres, from the tail into the off-board head.
+            centre = BLOCK_SIZE // 2
+            alpha = PATH[3] / 255
+            for x, y in (head, (neck_pixel[0] - 5, neck_pixel[1] - 5)):
+                under = surface.get_at((x + 5, y + 5))
+                on_path = surface.get_at((x + centre, y + centre))
+                for channel in range(3):
+                    # SDL's blend can round a channel one step differently.
+                    self.assertAlmostEqual(on_path[channel], PATH[channel] * alpha
+                                           + under[channel] * (1 - alpha), delta=1)
+            viewer.handle(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_p))
+            viewer.draw(surface)
+            self.assertEqual(surface.get_at((head[0] + centre, head[1] + centre))[:3], RANDOM_HEAD)
+
+
 class WeightPlotTests(unittest.TestCase):
     def test_every_architecture_plots_and_maps_its_input_columns(self):
         import visualize_weights
@@ -555,7 +636,7 @@ class TrainingCliTests(unittest.TestCase):
         self.root = Path(self.directory.name)
         source = Path(__file__).resolve().parent
         for name in ('agent.py', 'model.py', 'game.py', 'helper.py', 'configuration.py',
-                     'state.py', 'reward_defaults.py', 'train.py'):
+                     'state.py', 'reward_defaults.py', 'train.py', 'deaths.py'):
             if (source / name).exists():
                 shutil.copy2(source / name, self.root / name)
         self.presets = {
@@ -635,6 +716,11 @@ train.main({import_args})
         self.assertGreater(resumed['training_state']['optimizer_steps'], checkpoint['training_state']['optimizer_steps'])
         with (first / 'training_scores.csv').open() as handle:
             self.assertEqual([int(row['game']) for row in csv.DictReader(handle)], [1, 2, 3])
+        deaths = [json.loads(line) for line in (first / 'deaths.jsonl').read_text().splitlines()]
+        self.assertEqual([death['game'] for death in deaths], [1, 2, 3])
+        self.assertTrue(all(isinstance(death['random_move'], bool) for death in deaths))
+        # Each game tracks every exploration, and only on-board segments are highlighted.
+        self.assertTrue(all(len(death['random_segments']) <= death['random_moves'] for death in deaths))
 
         # Training settings may change between invocations; the run resumes
         # with the new values and records them.

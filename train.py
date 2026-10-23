@@ -136,8 +136,8 @@ def main(argv=None):
         print(f'Model: {args.model} | Run: {run_name} | Output: {run_dir}', flush=True)
         train(max_games=args.games, checkpoint_path=run_dir / 'latest.pth',
               best_checkpoint_path=run_dir / 'best.pth',
-              csv_path=run_dir / 'training_scores.csv', agent=agent,
-              render=args.render, reset_epsilon=args.reset_epsilon,
+              csv_path=run_dir / 'training_scores.csv', deaths_path=run_dir / 'deaths.jsonl',
+              agent=agent, render=args.render, reset_epsilon=args.reset_epsilon,
               start_length=args.start_length, epsilon_ramp=args.epsilon_ramp)
     except (OSError, ValueError, RuntimeError, pickle.UnpicklingError, KeyError, TypeError) as err:
         parser.error(str(err))

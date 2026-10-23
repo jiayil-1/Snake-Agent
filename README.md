@@ -45,6 +45,7 @@ Each run writes to `runs/<run-name>/` relative to the repository, even when the 
 | `latest.pth` | Weights, optimizer, scheduler, counters, exploration state, records, and configuration for resuming. Saved after each step of the parallel games in which an episode completed, and on graceful termination. |
 | `best.pth` | Checkpoint from the completed episode with the highest cumulative reward. |
 | `training_scores.csv` | This run's cumulative game numbers, scores, ending reasons, and starting scores. |
+| `deaths.jsonl` | Each completed game's final board (snake, food, and direction of every segment), with its game number, score, ending reason, steps, the epsilon of its last move, whether that move was a random exploration, how many of the game's moves were random explorations, and which segments those moves placed, for `death_viewer.py`. |
 | `config.json` | Fully resolved configuration, including defaults, used by this run. |
 
 Repeat the same command to resume automatically from `latest.pth`. `Ctrl+C` or a termination signal saves latest progress, including updates made during unfinished episodes, without logging those episodes as completed. Resume starts new episodes with an empty replay buffer. Abrupt termination can only recover the last saved checkpoint. Generated run folders are ignored by Git.
@@ -134,6 +135,16 @@ python visualize_weights.py --checkpoint model/model.pth --out weights.png
 ```
 
 `--model`, `--run`, and `--checkpoint` select a checkpoint as in `inference.py`, and the output defaults to `<checkpoint name>_weights.png` beside it. Like inference, it reads a private snapshot, so it is safe to run during training. The image shows every 3×3 convolution kernel (rows are output channels, columns input channels), each dense weight matrix, and per-layer weight distributions. Two panels estimate what the network reads: board input importance maps each board cell, after the CNNs' two max-pools, to the L2 norm of its column in the first dense layer, per head, food, and body channel (or combined over the residual CNN's 32 feature channels), and metadata feature importance does the same for each metadata input. Large weights only mean a strong connection; they do not show how often an input is active.
+
+Click through a run's deaths in a window drawn like the game:
+
+```bash
+python death_viewer.py --model raw_skip_cnn
+python death_viewer.py --run cnn-experiment
+python death_viewer.py --deaths path/to/deaths.jsonl
+```
+
+Each game's final board is shown as the game drew its last frame, inside a one-cell wall ring so a head that left the board stays visible; a collision outlines the head in red. A translucent line through the segment centres traces the path from tail to head; press `P` to hide or show it. The header shows the game number, ending reason, score and starting score, length, steps, and epsilon. With `--epsilon-ramp`, epsilon reads as the scheduled value times the ramp multiplier, with the effective value the last move used. Segments placed by a random exploration are drawn green, and a green swatch beside the ending reason counts the game's random moves. Games logged before this tracking only call out a random final move. The list beside the board sorts by game, score, effective epsilon, final move (`random` or `greedy`; `-` for games logged before moves were tracked), or ending reason: click a column (again to reverse it) or press `G`, `S`, `E`, or `M`. Step with the arrow keys, the mouse wheel, the Prev and Next buttons, `PgUp`/`PgDn`, or `Home`/`End`, or click a row. The viewer follows the file, so games a running training process finishes join the list within a second. Only games trained after death recording was added have a recorded board.
 
 ## Evaluate a model
 

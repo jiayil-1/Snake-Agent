@@ -14,6 +14,7 @@ from configuration import (
     DEFAULT_TRAINING, epsilon_ramp_arg, positive_int, resolve_preset, shape_conflicts,
     start_length_arg, validate_epsilon_ramp,
 )
+from deaths import append_death, death_record
 from helper import append_score, ensure_score_columns, plot
 from state import StateLayout, encode_resolved_state, get_observation_spec
 
@@ -310,6 +311,10 @@ class Agent:
         ``safe_moves`` optionally lists the move indices exploration may pick per state;
         a state with none left to pick acts greedily.
         """
+        return self.choose_actions(states, epsilon_scales, safe_moves)[0]
+
+    def choose_actions(self, states, epsilon_scales=None, safe_moves=None):
+        """Like ``get_actions``, also returning whether each move was a random exploration."""
         self._update_epsilon()
         if epsilon_scales is None:
             epsilon_scales = [1.0] * len(states)
@@ -317,6 +322,7 @@ class Agent:
             safe_moves = [range(3)] * len(states)
         moves = [random.choice(safe) if safe and random.random() < self.epsilon * scale else None
                  for scale, safe in zip(epsilon_scales, safe_moves)]
+        explored = [move is not None for move in moves]
         greedy = [index for index, move in enumerate(moves) if move is None]
         if greedy:
             flat = np.stack([self.state_layout.pack(states[index]) for index in greedy])
@@ -330,7 +336,7 @@ class Agent:
             final_move = [0, 0, 0]
             final_move[move] = 1
             final_moves.append(final_move)
-        return final_moves
+        return final_moves, explored
 
     def _update_epsilon(self):
         games_since_reset = max(0, self.n_games - self.epsilon_start_game)
@@ -410,7 +416,7 @@ def read_recent_scores(csv_path, count):
 def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
           csv_path=TRAINING_SCORES_CSV, render=False, reset_epsilon=False,
           config=None, device='auto', agent=None, best_checkpoint_path=None,
-          start_length=None, compile_model=True, epsilon_ramp=None):
+          start_length=None, compile_model=True, epsilon_ramp=None, deaths_path=None):
     """Train one agent on lockstep parallel games.
 
     Finished slots start a new game immediately until ``max_games`` have
@@ -419,6 +425,7 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
     or of a length drawn per game from an inclusive ``(min, max)`` range.
     ``epsilon_ramp`` is a ``(start, stop)`` pair of points gained since spawn: each game
     explores with epsilon 0 until ``start``, rising linearly to the scheduled epsilon at ``stop``.
+    ``deaths_path`` appends each finished game's final board for ``death_viewer.py``.
     """
     validate_epsilon_ramp(epsilon_ramp)
     plot_scores = []
@@ -458,6 +465,8 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
     games_this_run = 0
     games_started = slot_count
     episode_rewards = [0.0] * slot_count
+    # Move numbers of each slot's epsilon explorations in its current game.
+    random_steps = [[] for _ in range(slot_count)]
     # Replay serials of each slot's latest moves, flagged when its game ends in a collision.
     recent_serials = [deque(maxlen=agent.death_replay_window) for _ in range(slot_count)]
     termination_requested = False
@@ -488,15 +497,18 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
                 for slot in active
             ]
             # Exploration only picks moves that survive the step.
-            moves = agent.get_actions([states[slot] for slot in active], epsilon_scales,
-                                      [games[slot].safe_actions() for slot in active])
+            moves, explored = agent.choose_actions([states[slot] for slot in active], epsilon_scales,
+                                                   [games[slot].safe_actions() for slot in active])
             still_active = []
             completed_games = 0
             new_highest_reward = False
-            for slot, final_move in zip(active, moves):
+            scales = epsilon_scales or [1.0] * len(active)
+            for slot, final_move, epsilon_scale, random_move in zip(active, moves, scales, explored):
                 game = games[slot]
                 reward, done, score = game.play_step(final_move)
                 episode_rewards[slot] += reward
+                if random_move:
+                    random_steps[slot].append(game.frame_iteration)
                 state_new = agent.get_state(game)
 
                 # Keep each transition and train from replay at the configured cadence.
@@ -533,6 +545,10 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
 
                 append_score(csv_path, game_number_offset + games_this_run, score, end_reason,
                              game.start_score)
+                if deaths_path is not None:
+                    append_death(deaths_path, death_record(
+                        game, game_number_offset + games_this_run, agent.epsilon, epsilon_scale,
+                        random_steps[slot]))
                 if not HIDE_PLOT:
                     plot_scores.append(score)
                     recent_scores.append(score)
@@ -543,6 +559,7 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
                     game.reset()
                     states[slot] = agent.get_state(game)
                     episode_rewards[slot] = 0.0
+                    random_steps[slot] = []
                     recent_serials[slot].clear()
                     games_started += 1
                     still_active.append(slot)

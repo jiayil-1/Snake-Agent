@@ -382,6 +382,7 @@ class BatchedActionTests(unittest.TestCase):
             moves = agent.get_actions(states)
             self.assertEqual(calls, [])
             self.assertTrue(all(sorted(move) == [0, 0, 1] for move in moves))
+            self.assertEqual(agent.choose_actions(states)[1], [True] * len(states))
 
     def test_epsilon_scales_make_zero_scaled_rows_greedy(self):
         states = [{'board_state': np.zeros((3, 24, 32), dtype=np.float32),
@@ -392,8 +393,9 @@ class BatchedActionTests(unittest.TestCase):
             handle = agent.model.register_forward_hook(
                 lambda _module, inputs, _output: batch_sizes.append(inputs[0]['metadata'].shape[0]))
             self.addCleanup(handle.remove)
-            agent.get_actions(states, [0.0, 1.0, 0.0])
+            _, explored = agent.choose_actions(states, [0.0, 1.0, 0.0])
             self.assertEqual(batch_sizes, [2])
+            self.assertEqual(explored, [False, True, False])
 
 
 class EpsilonRampTests(unittest.TestCase):
@@ -416,8 +418,8 @@ class EpsilonRampTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             agent = Agent(config={'architecture': 'mlp', 'training': {'parallel_games': 1}},
                           device='cpu', checkpoint_path=Path(directory) / 'missing.pth')
-            original = agent.get_actions
-            agent.get_actions = lambda states, epsilon_scales=None, safe_moves=None: (
+            original = agent.choose_actions
+            agent.choose_actions = lambda states, epsilon_scales=None, safe_moves=None: (
                 scales.append(epsilon_scales) or original(states, epsilon_scales, safe_moves))
             with patch.object(agent_module, 'SnakeGameAI', ScoringGame), \
                     contextlib.redirect_stdout(io.StringIO()):
@@ -691,7 +693,8 @@ class SafeActionTests(unittest.TestCase):
                 'epsilon_start': 1.0, 'epsilon_min': 1.0}},
                 device='cpu', checkpoint_path=Path(directory) / 'missing.pth')
             for _ in range(50):
-                moves = agent.get_actions(states, safe_moves=[[2], [0, 1], []])
+                moves, explored = agent.choose_actions(states, safe_moves=[[2], [0, 1], []])
+                self.assertEqual(explored, [True, True, False])
                 self.assertEqual(moves[0], [0, 0, 1])
                 self.assertIn(moves[1], ([1, 0, 0], [0, 1, 0]))
 
