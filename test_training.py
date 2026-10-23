@@ -22,7 +22,7 @@ import torch
 
 from configuration import load_presets, resolve_preset
 from model import ARCHITECTURES, QTrainer
-from state import encode_state, get_observation_spec
+from state import encode_state, get_observation_spec, metadata_features
 
 
 class ConfigurationTests(unittest.TestCase):
@@ -36,13 +36,15 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(cnn['training']['lr_step_size'], 500)
         self.assertEqual(presets['mlp']['architecture_options']['hidden_sizes'], [128, 128])
         self.assertEqual(cnn['state_representation'], {
-            'encoder': 'board_metadata', 'options': {'body_encoding': 'gradient'},
+            'encoder': 'board_metadata',
+            'options': {'body_encoding': 'gradient', 'food_distance': True},
         })
         self.assertEqual(cnn['rewards']['food_reward'], 10)
         self.assertEqual(cnn['architecture_options']['channels'], 32)
         self.assertEqual(resolve_preset(cnn), cnn)
         raw_skip = presets['raw_skip_cnn']
         self.assertEqual(raw_skip['architecture_options']['channels'], 6)
+        self.assertFalse(raw_skip['state_representation']['options']['food_distance'])
         self.assertEqual(resolve_preset(raw_skip), raw_skip)
 
     def test_invalid_presets_fail(self):
@@ -63,6 +65,12 @@ class ConfigurationTests(unittest.TestCase):
             {'architecture': 'mlp', 'state_representation': {'encoder': 'unknown'}},
             {'architecture': 'mlp', 'state_representation': {
                 'encoder': 'board_metadata', 'options': {'body_encoding': 'other'},
+            }},
+            {'architecture': 'mlp', 'state_representation': {
+                'encoder': 'board_metadata', 'options': {'food_distance': 0},
+            }},
+            {'architecture': 'mlp', 'state_representation': {
+                'encoder': 'metadata_only', 'options': {'body_encoding': 'binary'},
             }},
             {'architecture': 'residual_cnn', 'state_representation': {'encoder': 'metadata_only'}},
             {'architecture': 'mlp', 'rewards': {'food_reward': float('inf')}},
@@ -156,6 +164,18 @@ class ArchitectureTests(unittest.TestCase):
             'has_board': False, 'board_channels': 0, 'board_height': 0,
             'board_width': 0, 'metadata_size': 12,
         })
+
+        for encoder in ('board_metadata', 'metadata_only'):
+            with self.subTest(encoder=encoder):
+                representation = resolve_preset({
+                    'architecture': 'mlp',
+                    'state_representation': {'encoder': encoder, 'options': {'food_distance': False}},
+                })['state_representation']
+                without_distance = encode_state(representation, game, 32, 24)
+                np.testing.assert_array_equal(without_distance['metadata'], gradient['metadata'][:-1])
+                self.assertEqual(get_observation_spec(representation, 24, 32)['metadata_size'], 11)
+                self.assertNotIn('food dist', metadata_features(representation))
+                self.assertEqual(len(metadata_features(representation)), 11)
 
     def test_network_options_and_metadata_only_training(self):
         config = resolve_preset({
@@ -467,6 +487,9 @@ class WeightPlotTests(unittest.TestCase):
 
         cases = [
             ({'architecture': 'raw_skip_cnn'}, (3, 6, 8)),
+            ({'architecture': 'raw_skip_cnn', 'state_representation': {
+                'encoder': 'board_metadata', 'options': {'food_distance': False},
+            }}, (3, 6, 8)),
             ({'architecture': 'residual_cnn'}, (32, 6, 8)),
             ({'architecture': 'mlp'}, (3, 24, 32)),
             ({'architecture': 'mlp', 'state_representation': {'encoder': 'metadata_only'}}, None),
@@ -482,7 +505,8 @@ class WeightPlotTests(unittest.TestCase):
                         model, 24, 32)
                     self.assertEqual(shape, board_shape)
                     self.assertEqual(board_layer is None, board_shape is None)
-                    self.assertEqual(metadata_layer.weight[:, columns].shape[1], 12)
+                    self.assertEqual(metadata_layer.weight[:, columns].shape[1],
+                                     spec['metadata_size'])
 
                     checkpoint = Path(directory) / f'{len(os.listdir(directory))}.pth'
                     torch.save({'model_state_dict': model.state_dict(), 'config': config}, checkpoint)

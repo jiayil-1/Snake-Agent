@@ -21,7 +21,7 @@ from torch import nn
 from configuration import REPO_ROOT, load_presets
 from game import BLOCK_SIZE
 from inference import BOARD_HEIGHT, BOARD_WIDTH, load_model, resolve_checkpoint, snapshot_checkpoint
-from state import BOARD_CHANNELS, METADATA_FEATURES
+from state import BOARD_CHANNELS, metadata_features
 
 ACTIONS = ('straight', 'right', 'left')
 CONV_COLUMNS = 4
@@ -117,7 +117,7 @@ def plot_board_importance(subfig, layer, shape, pooled_grid):
                     f'input column{pooled}')
 
 
-def plot_dense(subfig, linears, metadata_layer, board_split):
+def plot_dense(subfig, linears, metadata_layer, metadata_names, board_split):
     # Keep narrow matrices wide enough to label and very wide ones from crowding the row.
     widths = [min(max(layer.in_features, 100), 400) for _, layer in linears]
     axes = subfig.subplots(1, len(linears), width_ratios=widths, squeeze=False)[0]
@@ -129,8 +129,8 @@ def plot_dense(subfig, linears, metadata_layer, board_split):
         ax.set_title(f'{name} {tuple(weight.shape)}', fontsize=10)
         ax.set_xlabel('input')
         ax.set_ylabel('output')
-        if layer is metadata_layer and layer.in_features == len(METADATA_FEATURES):
-            ax.set_xticks(range(len(METADATA_FEATURES)), METADATA_FEATURES, rotation=90, fontsize=7)
+        if layer is metadata_layer and layer.in_features == len(metadata_names):
+            ax.set_xticks(range(len(metadata_names)), metadata_names, rotation=90, fontsize=7)
         if name == 'head.0' and board_split is not None:
             ax.axvline(board_split - 0.5, color='black', linewidth=1)
             ax.set_xticks([board_split / 2, (board_split + layer.in_features) / 2],
@@ -141,7 +141,7 @@ def plot_dense(subfig, linears, metadata_layer, board_split):
     subfig.suptitle('Dense weight matrices')
 
 
-def plot_summary(subfig, model, metadata_layer, metadata_columns):
+def plot_summary(subfig, model, metadata_layer, metadata_columns, metadata_names):
     weights = [(name.removesuffix('.weight'), parameter.detach().float().cpu().flatten())
                for name, parameter in model.named_parameters() if name.endswith('weight')]
     distribution_ax, metadata_ax = subfig.subplots(1, 2)
@@ -152,14 +152,12 @@ def plot_summary(subfig, model, metadata_layer, metadata_columns):
     distribution_ax.set_title('Weight distribution per layer (outliers hidden)')
 
     importance = metadata_layer.weight.detach().float().cpu()[:, metadata_columns].norm(dim=0)
-    names = METADATA_FEATURES if len(importance) == len(METADATA_FEATURES) else [
-        f'feature {index}' for index in range(len(importance))]
-    metadata_ax.barh(names, importance)
+    metadata_ax.barh(metadata_names, importance)
     metadata_ax.invert_yaxis()
     metadata_ax.set_title('Metadata feature importance (L2 norm of input column)')
 
 
-def plot_weights(model, title, output_path, grid_height, grid_width):
+def plot_weights(model, title, output_path, grid_height, grid_width, metadata_names):
     convs = [(name, module) for name, module in model.named_modules() if isinstance(module, nn.Conv2d)]
     linears = [(name, module) for name, module in model.named_modules() if isinstance(module, nn.Linear)]
     board_layer, board_shape, metadata_layer, metadata_columns = input_layers(model, grid_height, grid_width)
@@ -172,8 +170,10 @@ def plot_weights(model, title, output_path, grid_height, grid_width):
     if board_layer is not None:
         sections.append((4.0, lambda subfig: plot_board_importance(
             subfig, board_layer, board_shape, board_shape[1] < grid_height)))
-    sections.append((5.0, lambda subfig: plot_dense(subfig, linears, metadata_layer, board_split)))
-    sections.append((4.5, lambda subfig: plot_summary(subfig, model, metadata_layer, metadata_columns)))
+    sections.append((5.0, lambda subfig: plot_dense(
+        subfig, linears, metadata_layer, metadata_names, board_split)))
+    sections.append((4.5, lambda subfig: plot_summary(
+        subfig, model, metadata_layer, metadata_columns, metadata_names)))
 
     heights = [height for height, _ in sections]
     fig = plt.figure(figsize=(18, sum(heights) + 0.8), layout='constrained')
@@ -211,7 +211,7 @@ def main(argv=None):
     shown_path = path.resolve().relative_to(REPO_ROOT) if path.resolve().is_relative_to(REPO_ROOT) else path
     output_path = args.out or path.with_name(f'{path.stem}_weights.png')
     plot_weights(model, f'{config["architecture"]}: {shown_path} ({trained}, {parameters:,} parameters)',
-                 output_path, grid_height, grid_width)
+                 output_path, grid_height, grid_width, metadata_features(config['state_representation']))
     print(f'Saved weights plot to {output_path}')
 
 

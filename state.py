@@ -14,6 +14,12 @@ METADATA_FEATURES = (
 )
 
 
+def _metadata_features(options):
+    # Disabling food_distance omits the normalized head-to-food distance.
+    return tuple(name for name in METADATA_FEATURES
+                 if name != 'food dist' or options['food_distance'])
+
+
 def _encode_board_metadata(game, grid_width, grid_height, options):
     from game import BLOCK_SIZE
 
@@ -38,15 +44,15 @@ def _encode_board_metadata(game, grid_width, grid_height, options):
             value = 1.0 if options['body_encoding'] == 'binary' else 1.0 - 0.5 * index / denominator
             board[2, y, x] = value
 
-    return {'board_state': board, 'metadata': _metadata(game, head, grid_width, grid_height)}
+    return {'board_state': board, 'metadata': _metadata(game, head, grid_width, grid_height, options)}
 
 
-def _encode_metadata_only(game, grid_width, grid_height, _options):
+def _encode_metadata_only(game, grid_width, grid_height, options):
     head = game.snake[0]
-    return {'metadata': _metadata(game, head, grid_width, grid_height)}
+    return {'metadata': _metadata(game, head, grid_width, grid_height, options)}
 
 
-def _metadata(game, head, grid_width, grid_height):
+def _metadata(game, head, grid_width, grid_height, options):
     from game import BLOCK_SIZE, Direction, Point
 
     direction_order = [Direction.RIGHT, Direction.DOWN, Direction.LEFT, Direction.UP]
@@ -71,7 +77,7 @@ def _metadata(game, head, grid_width, grid_height):
     food_distance = (
         abs(head.x - game.food.x) + abs(head.y - game.food.y)
     ) / (BLOCK_SIZE * max_distance)
-    return np.array([
+    features = dict(zip(METADATA_FEATURES, (
         int(game.direction == Direction.LEFT),
         int(game.direction == Direction.RIGHT),
         int(game.direction == Direction.UP),
@@ -84,23 +90,24 @@ def _metadata(game, head, grid_width, grid_height):
         int(game.food.y < head.y),
         int(game.food.y > head.y),
         food_distance,
-    ], dtype=np.float32)
+    ), strict=True))
+    return np.array([features[name] for name in _metadata_features(options)], dtype=np.float32)
 
 
 STATE_ENCODERS = {
     'board_metadata': {
         'encode': _encode_board_metadata,
-        'options': {'body_encoding': 'gradient'},
-        'allowed_options': {'body_encoding'},
+        'options': {'body_encoding': 'gradient', 'food_distance': True},
+        'allowed_options': {'body_encoding', 'food_distance'},
         'board_channels': 3,
-        'metadata_size': 12,
+        'metadata_features': _metadata_features,
     },
     'metadata_only': {
         'encode': _encode_metadata_only,
-        'options': {},
-        'allowed_options': set(),
+        'options': {'food_distance': True},
+        'allowed_options': {'food_distance'},
         'board_channels': 0,
-        'metadata_size': 12,
+        'metadata_features': _metadata_features,
     },
 }
 
@@ -134,7 +141,15 @@ def resolve_state_representation(representation=None):
     resolved_options = deepcopy(encoder['options']) | deepcopy(options)
     if name == 'board_metadata' and resolved_options['body_encoding'] not in ('gradient', 'binary'):
         raise ValueError('body_encoding must be gradient or binary')
+    if type(resolved_options['food_distance']) is not bool:
+        raise ValueError('food_distance must be true or false')
     return {'encoder': name, 'options': resolved_options}
+
+
+def metadata_features(representation):
+    """Names of the metadata features a representation emits, in order."""
+    resolved = resolve_state_representation(representation)
+    return STATE_ENCODERS[resolved['encoder']]['metadata_features'](resolved['options'])
 
 
 def get_observation_spec(representation, board_height, board_width):
@@ -147,7 +162,7 @@ def get_observation_spec(representation, board_height, board_width):
         'board_channels': encoder['board_channels'],
         'board_height': board_height if has_board else 0,
         'board_width': board_width if has_board else 0,
-        'metadata_size': encoder['metadata_size'],
+        'metadata_size': len(metadata_features(resolved)),
     }
 
 

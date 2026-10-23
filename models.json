@@ -45,7 +45,8 @@
     "state_representation": {
       "encoder": "board_metadata",
       "options": {
-        "body_encoding": "gradient"
+        "body_encoding": "gradient",
+        "food_distance": false
       }
     },
     "rewards": {
