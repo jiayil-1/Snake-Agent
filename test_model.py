@@ -417,8 +417,8 @@ class EpsilonRampTests(unittest.TestCase):
             agent = Agent(config={'architecture': 'mlp', 'training': {'parallel_games': 1}},
                           device='cpu', checkpoint_path=Path(directory) / 'missing.pth')
             original = agent.get_actions
-            agent.get_actions = lambda states, epsilon_scales=None: (
-                scales.append(epsilon_scales) or original(states, epsilon_scales))
+            agent.get_actions = lambda states, epsilon_scales=None, safe_moves=None: (
+                scales.append(epsilon_scales) or original(states, epsilon_scales, safe_moves))
             with patch.object(agent_module, 'SnakeGameAI', ScoringGame), \
                     contextlib.redirect_stdout(io.StringIO()):
                 agent_module.train(max_games=1, agent=agent, start_length=10,
@@ -633,6 +633,51 @@ class RewardConfigurationTests(unittest.TestCase):
                       if Point(x, y) != free]
         self.assertTrue(game._place_food())
         self.assertEqual(game.food, free)
+
+
+class SafeActionTests(unittest.TestCase):
+    def test_safe_actions_are_exactly_the_moves_that_do_not_collide(self):
+        random.seed(0)
+        seen = set()
+        for _ in range(100):
+            game = SnakeGameAI(w=120, h=100, render=False, start_length=(1, 14))
+            done = False
+            while not done:
+                # Food on the tail keeps the tail in place, so following it collides.
+                if random.random() < 0.2:
+                    game.food = game.snake[-1]
+                expected = []
+                for index in range(3):
+                    trial = copy.copy(game)
+                    trial.snake = list(game.snake)
+                    trial.play_step(np.eye(3, dtype=int)[index].tolist())
+                    if trial.end_reason not in ('self-collision', 'wall-collision'):
+                        expected.append(index)
+                self.assertEqual(game.safe_actions(), expected)
+                seen.add(len(expected))
+                _, done, _ = game.play_step(np.eye(3, dtype=int)[random.randrange(3)].tolist())
+        self.assertEqual(seen, {0, 1, 2, 3})
+
+    def test_the_head_may_follow_a_tail_that_moves_away(self):
+        game = SnakeGameAI(w=40, h=200, render=False)
+        # A 2x2 loop in the top corner: only turning left, onto the tail, stays on the board.
+        game.snake = [Point(20, 0), Point(20, 20), Point(0, 20), Point(0, 0)]
+        game.head, game.direction, game.food = game.snake[0], Direction.UP, Point(0, 100)
+        self.assertEqual(game.safe_actions(), [2])
+        game.food = game.snake[-1]
+        self.assertEqual(game.safe_actions(), [])
+
+    def test_exploration_picks_only_safe_moves_and_acts_greedily_without_any(self):
+        states = [{'board_state': np.zeros((3, 24, 32), dtype=np.float32),
+                   'metadata': np.zeros(12, dtype=np.float32)}] * 3
+        with tempfile.TemporaryDirectory() as directory:
+            agent = Agent(config={'architecture': 'mlp', 'training': {
+                'epsilon_start': 1.0, 'epsilon_min': 1.0}},
+                device='cpu', checkpoint_path=Path(directory) / 'missing.pth')
+            for _ in range(50):
+                moves = agent.get_actions(states, safe_moves=[[2], [0, 1], []])
+                self.assertEqual(moves[0], [0, 0, 1])
+                self.assertIn(moves[1], ([1, 0, 0], [0, 1, 0]))
 
 
 class StartLengthTests(unittest.TestCase):

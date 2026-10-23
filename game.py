@@ -266,7 +266,29 @@ class SnakeGameAI:
         pygame.display.flip()
 
 
+    def safe_actions(self):
+        """Indices of the [straight, right, left] moves that do not collide on this step.
+
+        A tail that moves away this step frees its cell, so the head may follow it.
+        """
+        safe = []
+        for index in range(3):
+            action = [0, 0, 0]
+            action[index] = 1
+            _, head = self._next_head(action)
+            body = self.snake if head == self.food else self.snake[:-1]
+            in_bounds = 0 <= head.x <= self.w - BLOCK_SIZE and 0 <= head.y <= self.h - BLOCK_SIZE
+            if in_bounds and head not in body:
+                safe.append(index)
+        return safe
+
+
     def _move(self, action):
+        self.direction, self.head = self._next_head(action)
+
+
+    def _next_head(self, action):
+        """Return the direction and head cell that ``action`` leads to, without moving."""
         # [straight, right, left]
 
         clock_wise = [Direction.RIGHT, Direction.DOWN, Direction.LEFT, Direction.UP]
@@ -281,17 +303,15 @@ class SnakeGameAI:
             next_idx = (idx - 1) % 4
             new_dir = clock_wise[next_idx] # left turn r -> u -> l -> d
 
-        self.direction = new_dir
-
         x = self.head.x
         y = self.head.y
-        if self.direction == Direction.RIGHT:
+        if new_dir == Direction.RIGHT:
             x += BLOCK_SIZE
-        elif self.direction == Direction.LEFT:
+        elif new_dir == Direction.LEFT:
             x -= BLOCK_SIZE
-        elif self.direction == Direction.DOWN:
+        elif new_dir == Direction.DOWN:
             y += BLOCK_SIZE
-        elif self.direction == Direction.UP:
+        elif new_dir == Direction.UP:
             y -= BLOCK_SIZE
 
-        self.head = Point(x, y)
+        return new_dir, Point(x, y)

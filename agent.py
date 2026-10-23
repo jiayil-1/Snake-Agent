@@ -267,16 +267,20 @@ class Agent:
         """Epsilon-greedy action selection."""
         return self.get_actions([state])[0]
 
-    def get_actions(self, states, epsilon_scales=None):
+    def get_actions(self, states, epsilon_scales=None, safe_moves=None):
         """Epsilon-greedy one-hot actions, with one forward pass for all greedy rows.
 
         ``epsilon_scales`` optionally multiplies epsilon per state, from 0 (greedy) to 1.
+        ``safe_moves`` optionally lists the move indices exploration may pick per state;
+        a state with none left to pick acts greedily.
         """
         self._update_epsilon()
         if epsilon_scales is None:
             epsilon_scales = [1.0] * len(states)
-        moves = [random.randint(0, 2) if random.random() < self.epsilon * scale else None
-                 for scale in epsilon_scales]
+        if safe_moves is None:
+            safe_moves = [range(3)] * len(states)
+        moves = [random.choice(safe) if safe and random.random() < self.epsilon * scale else None
+                 for scale, safe in zip(epsilon_scales, safe_moves)]
         greedy = [index for index, move in enumerate(moves) if move is None]
         if greedy:
             flat = np.stack([self.state_layout.pack(states[index]) for index in greedy])
@@ -445,7 +449,9 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
                 epsilon_ramp_scale(games[slot].score - games[slot].start_score, epsilon_ramp)
                 for slot in active
             ]
-            moves = agent.get_actions([states[slot] for slot in active], epsilon_scales)
+            # Exploration only picks moves that survive the step.
+            moves = agent.get_actions([states[slot] for slot in active], epsilon_scales,
+                                      [games[slot].safe_actions() for slot in active])
             still_active = []
             completed_games = 0
             new_highest_reward = False
