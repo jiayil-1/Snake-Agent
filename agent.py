@@ -37,6 +37,7 @@ class ReplayMemory:
 
     Row layout: state, next state, action index, reward, done. A sampled
     minibatch therefore reaches the training device in a single copy.
+    Rows can be flagged as leading up to a death so sampling can favour them.
     """
 
     def __init__(self, capacity, layout):
@@ -44,25 +45,53 @@ class ReplayMemory:
         self.layout = layout
         self._size = 0
         self._next_index = 0
+        self._appended = 0
         # Zero-filled allocations are committed lazily, so memory grows as replay fills.
         self._rows = np.zeros((capacity, 2 * layout.size + 3), dtype=np.float32)
+        self._near_death = np.zeros(capacity, dtype=bool)
 
     def __len__(self):
         return self._size
 
     def append(self, state, action, reward, next_state, done):
-        """Store one transition, replacing the oldest when full. Actions are indices."""
+        """Store one transition, replacing the oldest when full. Actions are indices.
+
+        Returns the transition's serial number for ``mark_near_death``.
+        """
         size = self.layout.size
         row = self._rows[self._next_index]
         self.layout.pack(state, out=row[:size])
         self.layout.pack(next_state, out=row[size:2 * size])
         row[2 * size:] = action, reward, done
+        self._near_death[self._next_index] = False
         self._next_index = (self._next_index + 1) % self.capacity
         self._size = min(self._size + 1, self.capacity)
+        self._appended += 1
+        return self._appended - 1
 
-    def sample(self, batch_size, device):
-        """Return distinct uniformly sampled transitions as tensors on device."""
-        indices = random.sample(range(self._size), batch_size)
+    def mark_near_death(self, serials):
+        """Flag the transitions with these serial numbers that are still stored."""
+        for serial in serials:
+            if serial >= self._appended - self._size:
+                self._near_death[serial % self.capacity] = True
+
+    def sample(self, batch_size, device, near_death_fraction=0.0):
+        """Return distinct sampled transitions as tensors on device.
+
+        ``near_death_fraction`` of the batch is drawn uniformly from flagged rows and
+        the rest uniformly from unflagged rows, as far as each group allows.
+        """
+        if near_death_fraction == 0:
+            indices = random.sample(range(self._size), batch_size)
+        else:
+            flagged = np.flatnonzero(self._near_death[:self._size])
+            unflagged = np.flatnonzero(~self._near_death[:self._size])
+            count = min(round(batch_size * near_death_fraction), len(flagged))
+            count = max(count, batch_size - len(unflagged))
+            indices = np.concatenate([
+                flagged[random.sample(range(len(flagged)), count)],
+                unflagged[random.sample(range(len(unflagged)), batch_size - count)],
+            ])
         rows = torch.from_numpy(self._rows[indices]).to(device)
         size = self.layout.size
         return (
@@ -100,6 +129,8 @@ class Agent:
         self.replay_warmup = settings['replay_warmup']
         self.train_every = settings['train_every']
         self.parallel_games = settings['parallel_games']
+        self.death_replay_fraction = settings['death_replay_fraction']
+        self.death_replay_window = settings['death_replay_window']
         self.environment_steps = 0
         self.board_width = board_width
         self.board_height = board_height
@@ -249,9 +280,13 @@ class Agent:
 
     # ── Replay buffer interface ──────────────────────────────────────────
     def remember(self, state, action, reward, next_state, done):
-        """Store a transition whose action is one-hot, as returned by get_action."""
-        self.memory.append(state, int(np.argmax(action)), reward, next_state, done)
+        """Store a transition whose action is one-hot, as returned by get_action.
+
+        Returns its replay serial number for ``memory.mark_near_death``.
+        """
+        serial = self.memory.append(state, int(np.argmax(action)), reward, next_state, done)
         self.environment_steps += 1
+        return serial
 
     def train_long_memory(self):
         """Train one replay minibatch when warmup and update cadence are met."""
@@ -260,7 +295,8 @@ class Agent:
         if self.environment_steps % self.train_every != 0:
             return False
 
-        self.trainer.train_batch(*self.memory.sample(self.replay_batch_size, self.device))
+        self.trainer.train_batch(*self.memory.sample(self.replay_batch_size, self.device,
+                                                     self.death_replay_fraction))
         return True
 
     def get_action(self, state):
@@ -422,6 +458,8 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
     games_this_run = 0
     games_started = slot_count
     episode_rewards = [0.0] * slot_count
+    # Replay serials of each slot's latest moves, flagged when its game ends in a collision.
+    recent_serials = [deque(maxlen=agent.death_replay_window) for _ in range(slot_count)]
     termination_requested = False
     graceful_exit = False
 
@@ -462,7 +500,8 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
                 state_new = agent.get_state(game)
 
                 # Keep each transition and train from replay at the configured cadence.
-                agent.remember(states[slot], final_move, reward, state_new, done)
+                recent_serials[slot].append(
+                    agent.remember(states[slot], final_move, reward, state_new, done))
                 agent.train_long_memory()
                 states[slot] = state_new
                 if not done:
@@ -472,6 +511,8 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
                 # ── Episode finished ─────────────────────────────────────
                 episode_reward = episode_rewards[slot]
                 end_reason = game.end_reason
+                if end_reason in ('self-collision', 'wall-collision'):
+                    agent.memory.mark_near_death(recent_serials[slot])
                 print(f'\n\nFinished with reward {episode_reward:.1f}')
                 agent.n_games += 1
                 games_this_run += 1
@@ -502,6 +543,7 @@ def train(max_games=None, checkpoint_path=DEFAULT_CHECKPOINT_PATH,
                     game.reset()
                     states[slot] = agent.get_state(game)
                     episode_rewards[slot] = 0.0
+                    recent_serials[slot].clear()
                     games_started += 1
                     still_active.append(slot)
             active = still_active

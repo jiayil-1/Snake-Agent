@@ -467,6 +467,22 @@ class ReplayMemoryTests(unittest.TestCase):
                 for key in ('metadata', 'board_state'):
                     np.testing.assert_array_equal(batch[key][order][row].numpy(), expected[key])
 
+        # Serial 1 has been replaced, so only the stored serial 4 is flagged.
+        memory.mark_near_death([1, 4])
+        self.assertEqual(memory._near_death.tolist(), [False, True, False])
+        for _ in range(20):
+            rewards = memory.sample(2, 'cpu', near_death_fraction=0.5)[2]
+            self.assertEqual(sorted(rewards.tolist())[-1], 1.0)
+        # A fraction larger than the flagged rows fills the rest uniformly.
+        self.assertEqual(len(memory.sample(3, 'cpu', near_death_fraction=1.0)[2]), 3)
+        # Replacing the flagged row clears its flag; it is the oldest after two more appends.
+        for index in range(5, 7):
+            memory.append(state(index), 0, 0.0, state(index + 10), False)
+        self.assertEqual(memory._near_death.tolist(), [False, True, False])
+        memory.append(state(7), 0, 0.0, state(17), False)
+        self.assertEqual(memory._near_death.tolist(), [False, False, False])
+        self.assertEqual(len(memory.sample(2, 'cpu', near_death_fraction=1.0)[2]), 2)
+
         compact = StateLayout({**spec, 'has_board': False, 'board_channels': 0})
         self.assertEqual([field[0] for field in compact.fields], ['metadata'])
         self.assertEqual(compact.size, 12)

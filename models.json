@@ -38,6 +38,8 @@
       "lr_step_size": 500,
       "lr_decay": 0.95,
       "min_lr": 0.0001,
+      "death_replay_fraction": 0.1,
+      "death_replay_window": 10,
       "target_update_tau": 0.005
     }
   },
@@ -80,7 +82,9 @@
       "max_grad_norm": 5.0,
       "lr_step_size": 500,
       "lr_decay": 0.95,
-      "min_lr": 0.0001
+      "min_lr": 0.0001,
+      "death_replay_fraction": 0.10,
+      "death_replay_window": 10
     }
   },
   "mlp": {

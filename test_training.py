@@ -59,6 +59,8 @@ class ConfigurationTests(unittest.TestCase):
             {'architecture': 'mlp', 'training': {'replay_batch_size': True}},
             {'architecture': 'mlp', 'training': {'max_memory': 2, 'replay_warmup': 3}},
             {'architecture': 'mlp', 'training': {'min_lr': 1}},
+            {'architecture': 'mlp', 'training': {'death_replay_fraction': 1.5}},
+            {'architecture': 'mlp', 'training': {'death_replay_window': 0}},
             {'architecture': 'mlp', 'architecture_options': {'hidden_sizes': []}},
             {'architecture': 'mlp', 'architecture_options': {'hidden_sizes': [128, -1]}},
             {'architecture': 'residual_cnn', 'architecture_options': {'hidden_sizes': [128]}},
@@ -387,6 +389,37 @@ class CheckpointPolicyTests(unittest.TestCase):
                       best_checkpoint_path=best, csv_path=csv_path)
             _, means = plot.call_args.args
             self.assertEqual(means, [(sum(range(51, 150)) + 10) / 100])
+
+    def test_only_the_last_moves_before_a_collision_are_flagged_for_replay(self):
+        from agent import Agent, train
+        from game import SnakeGameAI
+
+        config = resolve_preset({'architecture': 'mlp', 'training': {
+            'parallel_games': 2, 'replay_batch_size': 2, 'replay_warmup': 32,
+            'max_memory': 32, 'death_replay_fraction': 0.5, 'death_replay_window': 2,
+        }})
+        # The first game crashes after three moves; the second times out after four.
+        endings = iter([(3, 'wall-collision'), (4, 'timeout')])
+
+        class ScriptedGame(SnakeGameAI):
+            def reset(self):
+                super().reset()
+                self.remaining, self.ending = next(endings)
+
+            def play_step(self, action):
+                self.remaining -= 1
+                self.end_reason = self.ending
+                return 0.0, self.remaining == 0, 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            latest = root / 'latest.pth'
+            agent = Agent(config=config, device='cpu', checkpoint_path=latest, strict_checkpoint=True)
+            with patch('agent.SnakeGameAI', ScriptedGame):
+                train(max_games=2, agent=agent, checkpoint_path=latest,
+                      best_checkpoint_path=root / 'best.pth', csv_path=root / 'scores.csv')
+        # Lockstep slots interleave: the crashed game wrote serials 0, 2, 4.
+        self.assertEqual(np.flatnonzero(agent.memory._near_death).tolist(), [2, 4])
 
     def test_parallel_slots_restart_until_the_run_limit(self):
         from agent import Agent, train
