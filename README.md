@@ -48,7 +48,7 @@ Each run writes to `runs/<run-name>/` relative to the repository, even when the 
 | `deaths.jsonl` | Each completed game's final board (snake, food, and direction of every segment), with its game number, score, ending reason, steps, the epsilon of its last move, whether that move was a random exploration, how many of the game's moves were random explorations, and which segments those moves placed, for `death_viewer.py`. |
 | `config.json` | Fully resolved configuration, including defaults, used by this run. |
 
-Repeat the same command to resume automatically from `latest.pth`. `Ctrl+C` or a termination signal saves latest progress, including updates made during unfinished episodes, without logging those episodes as completed. Resume starts new episodes with an empty replay buffer. Abrupt termination can only recover the last saved checkpoint. Generated run folders are ignored by Git.
+Repeat the same command to resume automatically from `latest.pth`. `Ctrl+C` or a termination signal saves latest progress, including updates made during unfinished episodes, without logging those episodes as completed. Resume starts new episodes with an empty replay buffer. Abrupt termination can only recover the last saved checkpoint. Git ignores generated run files except `.pth` checkpoints.
 
 ### Configure another model
 
